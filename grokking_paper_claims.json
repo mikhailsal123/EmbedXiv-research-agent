@@ -1,0 +1,36 @@
+{
+  "problems": [
+    {
+      "problem": "Loss-based measures do not fully explain when deep neural networks transition from interpolation to robust generalization.",
+      "domain": "machine learning / deep learning theory",
+      "keywords": [
+        "local complexity",
+        "linear regions",
+        "expressivity",
+        "training dynamics"
+      ],
+      "claims": [
+        {
+          "claim": "Changes in local complexity reveal a phase transition associated with delayed generalization and robustness.",
+          "functional_role": "Monitors training dynamics by measuring how a DNN's input space partition evolves, linking changes in local complexity to delayed generalization and robustness.",
+          "implementation_details": [
+            {
+              "detail": "Local complexity is defined as the density of linear regions in the input space, which corresponds to the number of spline partition regions per unit volume.",
+              "functional_role": "Provides a geometric proxy for DNN expressivity, enabling quantitative tracking of training progress."
+            }
+          ]
+        },
+        {
+          "claim": "Spline-partition geometry can explain how deep neural networks evolve during training.",
+          "functional_role": "Provides a geometric framework for interpreting DNN behavior, linking partition structure to generalization and robustness.",
+          "implementation_details": [
+            {
+              "detail": "Represent the network as a piecewise affine spline and analyze how its linear input-space regions change during training.",
+              "functional_role": "Turns model behavior into geometric structures whose evolution can be measured."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
