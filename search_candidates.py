@@ -1,7 +1,7 @@
 """Map extraction JSON to SPECTER2 queries, FAISS-search arXiv, optionally enrich via S2.
 
 Loads the latest corpus generation from Nebius Object Storage (published by
-datagen.create_corpus), encodes queries with SPECTER2, searches FAISS, and
+datagen.embed_corpus), encodes queries with SPECTER2, searches FAISS, and
 optionally enriches hits via Semantic Scholar.
 """
 

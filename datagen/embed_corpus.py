@@ -1,11 +1,9 @@
-"""Create the arXiv CS SPECTER2 corpus and publish it to Nebius Object Storage.
+"""GPU Job: embed preloaded arXiv metadata with SPECTER2 and publish FAISS.
 
-Dataset generation only: harvest → embed → FAISS → verify → /output.
-Search/loading lives in search_candidates.py.
+Expects metadata.sqlite already in Object Storage (from datagen.preload_metadata),
+mounted at INDEX_OUTPUT_DIR (default /output/arxiv-index).
 
-Nebius Job entrypoint:
-
-  python -m datagen.create_corpus
+  python -m datagen.embed_corpus
 """
 
 from __future__ import annotations
@@ -17,24 +15,14 @@ import os
 import random
 import re
 import sqlite3
-import sys
-import time
-import traceback
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
-import requests
 
 
-OAI_URL = "https://export.arxiv.org/oai2"
-OAI_NS = {
-    "oai": "http://www.openarchives.org/OAI/2.0/",
-    "arxiv": "http://arxiv.org/OAI/arXiv/",
-}
 DIMENSION = 768
 BASE_MODEL = "allenai/specter2_base"
 DOCUMENT_ADAPTER = "allenai/specter2"
@@ -204,169 +192,6 @@ def upsert_papers(
             )
             changed += 1
     return changed
-
-
-def iter_snapshot(path: Path, limit: int | None = None) -> Iterator[ArxivPaper]:
-    """Read the standard arXiv metadata JSONL snapshot."""
-    yielded = 0
-    with path.open() as source:
-        for line in source:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            yield ArxivPaper(
-                arxiv_id=item["id"],
-                title=item.get("title", ""),
-                abstract=item.get("abstract", ""),
-                categories=item.get("categories", ""),
-                authors=item.get("authors", ""),
-                license=item.get("license") or "",
-                datestamp=item.get("update_date", ""),
-            )
-            yielded += 1
-            if limit is not None and yielded >= limit:
-                return
-
-
-def _record_text(element: ET.Element | None, path: str) -> str:
-    if element is None:
-        return ""
-    child = element.find(path, OAI_NS)
-    return child.text or "" if child is not None else ""
-
-
-def parse_oai_page(xml_payload: bytes) -> tuple[list[ArxivPaper], str | None]:
-    root = ET.fromstring(xml_payload)
-    error = root.find("oai:error", OAI_NS)
-    if error is not None:
-        raise RuntimeError(f"arXiv OAI error: {error.get('code')}: {error.text}")
-
-    papers: list[ArxivPaper] = []
-    for record in root.findall(".//oai:record", OAI_NS):
-        header = record.find("oai:header", OAI_NS)
-        if header is None:
-            continue
-        identifier = _record_text(header, "oai:identifier")
-        datestamp = _record_text(header, "oai:datestamp")
-        deleted = header.get("status") == "deleted"
-        metadata = record.find("oai:metadata/arxiv:arXiv", OAI_NS)
-        if deleted:
-            papers.append(
-                ArxivPaper(
-                    arxiv_id=identifier,
-                    title="",
-                    abstract="",
-                    datestamp=datestamp,
-                    deleted=True,
-                )
-            )
-            continue
-        if metadata is None:
-            continue
-
-        author_names = []
-        for author in metadata.findall("arxiv:authors/arxiv:author", OAI_NS):
-            keyname = _record_text(author, "arxiv:keyname")
-            forenames = _record_text(author, "arxiv:forenames")
-            author_names.append(normalize_text(f"{forenames} {keyname}"))
-
-        papers.append(
-            ArxivPaper(
-                arxiv_id=_record_text(metadata, "arxiv:id") or identifier,
-                title=_record_text(metadata, "arxiv:title"),
-                abstract=_record_text(metadata, "arxiv:abstract"),
-                categories=_record_text(metadata, "arxiv:categories"),
-                authors=", ".join(name for name in author_names if name),
-                license=_record_text(metadata, "arxiv:license"),
-                datestamp=datestamp,
-            )
-        )
-
-    token_element = root.find(".//oai:resumptionToken", OAI_NS)
-    token = (
-        token_element.text.strip()
-        if token_element is not None and token_element.text
-        else None
-    )
-    return papers, token
-
-
-def harvest_oai(
-    connection: sqlite3.Connection,
-    *,
-    max_records: int | None = None,
-    from_date: str | None = None,
-    set_spec: str | None = None,
-    request_interval: float = 3.0,
-    session: requests.Session | None = None,
-) -> int:
-    """Harvest an idempotent, resumable sample or update from official OAI-PMH."""
-    http = session or requests.Session()
-    state_key = json.dumps(
-        {"from": from_date or "", "set": set_spec or ""}, sort_keys=True
-    )
-    state = connection.execute(
-        "SELECT resumption_token FROM harvest_state WHERE source = ?",
-        (state_key,),
-    ).fetchone()
-    token = state["resumption_token"] if state else None
-    harvested = 0
-
-    while True:
-        if token:
-            params = {"verb": "ListRecords", "resumptionToken": token}
-        else:
-            params = {"verb": "ListRecords", "metadataPrefix": "arXiv"}
-            if from_date:
-                params["from"] = from_date
-            if set_spec:
-                params["set"] = set_spec
-
-        for attempt in range(5):
-            response = http.get(
-                OAI_URL,
-                params=params,
-                headers={
-                    "User-Agent": os.getenv(
-                        "ARXIV_USER_AGENT", "EmbedXivResearchAgent/0.1"
-                    )
-                },
-                timeout=60,
-            )
-            if response.status_code not in {429, 500, 502, 503, 504}:
-                response.raise_for_status()
-                break
-            if attempt == 4:
-                response.raise_for_status()
-            retry_after = response.headers.get("Retry-After")
-            try:
-                delay = float(retry_after) if retry_after else 2**attempt
-            except ValueError:
-                delay = 2**attempt
-            time.sleep(min(max(delay, request_interval), 60))
-        papers, next_token = parse_oai_page(response.content)
-        upsert_papers(connection, papers)
-        harvested += len(papers)
-
-        with connection:
-            connection.execute(
-                """
-                INSERT INTO harvest_state (source, resumption_token, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(source) DO UPDATE SET
-                    resumption_token=excluded.resumption_token,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (state_key, next_token),
-            )
-
-        if not next_token or (max_records is not None and harvested >= max_records):
-            break
-        token = next_token
-        if request_interval > 0:
-            time.sleep(request_interval)
-
-    return harvested
 
 
 def _resolve_revision(repo_id: str, revision: str) -> str:
@@ -774,22 +599,19 @@ def publish(index_dir: Path, summary: dict) -> Path:
     destination = OUTPUT_DIR / "generations" / generation
     destination.mkdir(parents=True, exist_ok=False)
 
-    artifacts = [
-        path
-        for path in sorted(index_dir.rglob("*"))
-        if path.is_file()
-        and not path.name.endswith((".tmp", ".sqlite-shm", ".sqlite-wal"))
-    ]
+    # Only publish what search needs (not intermediate embedding shards).
+    publish_names = ("metadata.sqlite", "index.faiss", "manifest.json")
     checksums = {}
-    for source in artifacts:
-        relative = source.relative_to(index_dir)
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
+    for name in publish_names:
+        source = index_dir / name
+        if not source.is_file():
+            raise RuntimeError(f"Missing artifact to publish: {source}")
+        target = destination / name
         shutil.copyfile(source, target)
         source_digest = digest(source)
         if digest(target) != source_digest:
-            raise RuntimeError(f"Published checksum mismatch: {relative}")
-        checksums[str(relative)] = source_digest
+            raise RuntimeError(f"Published checksum mismatch: {name}")
+        checksums[name] = source_digest
 
     (destination / "checksums.sha256.json").write_text(
         json.dumps(checksums, indent=2, sort_keys=True) + "\n"
@@ -805,14 +627,32 @@ def publish(index_dir: Path, summary: dict) -> Path:
     return destination
 
 
+
 def main() -> None:
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    """Read preloaded metadata from the bucket mount, embed on GPU, publish FAISS."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+    preload_db = OUTPUT_DIR / "metadata.sqlite"
+    ready = OUTPUT_DIR / "PRELOAD_READY.json"
+    if not preload_db.is_file():
+        raise RuntimeError(
+            f"Missing {preload_db}. Run datagen.preload_metadata on your laptop first."
+        )
+    if not ready.is_file():
+        raise RuntimeError(f"Missing {ready}. Preload did not finish cleanly.")
+
+    # Copy preload into workspace so shards stay off the bucket until publish.
+    work_db = WORK_DIR / "metadata.sqlite"
+    if work_db.resolve() != preload_db.resolve():
+        shutil.copyfile(preload_db, work_db)
 
     connection = connect_database(WORK_DIR)
     try:
-        print("Harvesting the arXiv computer-science corpus", flush=True)
-        harvested = harvest_oai(connection, max_records=None, set_spec="cs")
+        papers = connection.execute(
+            "SELECT COUNT(*) FROM papers WHERE deleted = 0"
+        ).fetchone()[0]
+        print(f"Loaded preload with {papers:,} papers", flush=True)
 
         encoder = Specter2Encoder(device="cuda")
         embedded = embed_pending(

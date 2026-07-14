@@ -14,6 +14,6 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 COPY datagen ./datagen
 
 # Download the base model and both adapters while building the image.
-RUN python -c "from datagen.create_corpus import Specter2Encoder; Specter2Encoder(device='cpu')"
+RUN python -c "from datagen.embed_corpus import Specter2Encoder; Specter2Encoder(device='cpu')"
 
-ENTRYPOINT ["python", "-m", "datagen.create_corpus"]
+ENTRYPOINT ["python", "-m", "datagen.embed_corpus"]

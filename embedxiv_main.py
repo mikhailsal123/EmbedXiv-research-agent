@@ -1,7 +1,7 @@
 """Extract problems/claims/details with Qwen, then FAISS-search related arXiv papers.
 
 Glue CLI for extract_claims.py + search_candidates.py. The SPECTER2/FAISS corpus
-is loaded from Nebius Object Storage (published by datagen.create_corpus).
+is loaded from Nebius Object Storage (published by datagen.embed_corpus).
 """
 
 from __future__ import annotations

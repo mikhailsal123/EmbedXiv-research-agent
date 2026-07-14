@@ -89,15 +89,12 @@ NEBIUS_S3_REGION=<region>
 NEBIUS_S3_ACCESS_KEY_ID=...
 NEBIUS_S3_SECRET_ACCESS_KEY=...
 NEBIUS_S3_BUCKET=...
-NEBIUS_INDEX_PREFIX=arxiv-index
 S2_API_KEY=...
-ARXIV_USER_AGENT=EmbedXivResearchAgent/0.1 your-email@example.com
 ```
 
 `S2_API_KEY` is optional when search is run with `--no-s2`.
-`NEBIUS_INDEX_PREFIX` must match the Object Storage path the Job publishes
-(default `arxiv-index`, same as `/output/arxiv-index` when the bucket is mounted
-at `/output`).
+The Object Storage key prefix is fixed in code as `arxiv-index` (same as
+`/output/arxiv-index` when the Job mounts the bucket at `/output`).
 
 ## Nebius deployments
 
@@ -109,20 +106,33 @@ push it, create the resource in the Nebius UI.
 Always-on Ollama container with `qwen3:32b`. `extract_claims.py` calls it over
 the OpenAI-compatible API (`NEBIUS_ENDPOINT_URL` / `NEBIUS_ENDPOINT_TOKEN`).
 
-### SPECTER2 corpus Job (`datagen/`)
+### Corpus build (`datagen/`)
 
-One-shot GPU Job that builds the searchable arXiv index. Image entrypoint is
-`python -m datagen.create_corpus`: harvest CS metadata → SPECTER2-embed
-title+abstract → build FAISS → verify → write artifacts under `/output`
-(mount your Object Storage bucket there in the Job UI).
+Two steps — no live arXiv OAI crawl for the first build.
+
+**1. Laptop CPU preload** (`datagen/preload_metadata.py`)
+
+Download the Cornell Kaggle arXiv metadata snapshot (JSONL), keep CS papers by
+default, build `metadata.sqlite`, upload to Object Storage:
+
+```bash
+python3 -m datagen.preload_metadata \
+  --metadata-jsonl /path/to/arxiv-metadata-oai-snapshot.json
+```
+
+**2. Nebius GPU Job** (`datagen/embed_corpus.py`)
+
+Mount the same bucket at `/output`. The Job reads the preloaded SQLite, embeds
+title+abstract with SPECTER2, builds FAISS, and publishes only
+`metadata.sqlite`, `index.faiss`, `manifest.json` under
+`arxiv-index/generations/<timestamp>/` plus `LATEST.json`.
 
 ```text
 docker build -f datagen/Dockerfile -t <registry>/embedxiv-specter2:<tag> .
 docker push <registry>/embedxiv-specter2:<tag>
 ```
 
-Then in Nebius: create a Job from that image, GPU node, bucket mounted at
-`/output`. The Job writes the corpus into Object Storage.
+Create a GPU Job from that image with the bucket mounted at `/output`.
 
 Search never uses a project-local index directory. `search_candidates.py` reads
 `LATEST.json` from the bucket over the S3 API and downloads that generation's
@@ -163,8 +173,9 @@ Scholar keyword retriever.
 | `extract_claims.py` | Client: call Nebius Qwen → problem/claim/detail JSON |
 | `search_candidates.py` | Load corpus from Object Storage, SPECTER2/FAISS search, optional S2 |
 | `embedxiv_main.py` | Glue CLI: PDF/text → extract → search |
-| `datagen/create_corpus.py` | Job only: harvest, embed, build FAISS, publish to Object Storage |
-| `datagen/Dockerfile` | Nebius image for the corpus Job |
+| `datagen/preload_metadata.py` | Laptop CPU: Kaggle metadata → SQLite → Nebius bucket |
+| `datagen/embed_corpus.py` | GPU Job: embed preload → FAISS → publish index |
+| `datagen/Dockerfile` | Nebius image for the GPU embed Job |
 | `Dockerfile` | Nebius image for the Qwen/Ollama endpoint |
 
 ## Remaining stages

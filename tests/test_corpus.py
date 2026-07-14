@@ -1,22 +1,27 @@
-"""Tests for arXiv harvest, SPECTER2 embedding jobs, and FAISS search."""
+"""Tests for metadata preload and SPECTER2/FAISS embedding."""
 
 import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from datagen.create_corpus import (
+from datagen.embed_corpus import (
     DIMENSION,
-    ArxivPaper,
     build_faiss_index,
+    embed_pending,
+)
+from datagen.preload_metadata import (
+    ArxivPaper,
+    build_preload,
     canonical_arxiv_id,
     connect_database,
-    embed_pending,
+    is_computer_science,
     iter_snapshot,
-    parse_oai_page,
+    upload_preload,
     upsert_papers,
 )
 from search_candidates import ArxivIndex
@@ -48,47 +53,9 @@ class MetadataTests(unittest.TestCase):
             "solv-int/9701001",
         )
 
-    def test_parses_oai_records_and_deletions(self):
-        payload = b"""<?xml version="1.0"?>
-        <OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"
-                 xmlns:arXiv="http://arxiv.org/OAI/arXiv/">
-          <ListRecords>
-            <record>
-              <header>
-                <identifier>oai:arXiv.org:2001.01072</identifier>
-                <datestamp>2020-01-05</datestamp>
-              </header>
-              <metadata>
-                <arXiv:arXiv>
-                  <arXiv:id>2001.01072</arXiv:id>
-                  <arXiv:title> Linear Regions </arXiv:title>
-                  <arXiv:abstract> A geometric study. </arXiv:abstract>
-                  <arXiv:categories>cs.LG</arXiv:categories>
-                  <arXiv:authors>
-                    <arXiv:author>
-                      <arXiv:keyname>Zhang</arXiv:keyname>
-                      <arXiv:forenames>Xiao</arXiv:forenames>
-                    </arXiv:author>
-                  </arXiv:authors>
-                </arXiv:arXiv>
-              </metadata>
-            </record>
-            <record>
-              <header status="deleted">
-                <identifier>oai:arXiv.org:9999.99999</identifier>
-                <datestamp>2020-01-06</datestamp>
-              </header>
-            </record>
-            <resumptionToken>next-page</resumptionToken>
-          </ListRecords>
-        </OAI-PMH>"""
-
-        papers, token = parse_oai_page(payload)
-
-        self.assertEqual(token, "next-page")
-        self.assertEqual(papers[0].title, " Linear Regions ")
-        self.assertEqual(papers[0].authors, "Xiao Zhang")
-        self.assertTrue(papers[1].deleted)
+    def test_cs_filter(self):
+        self.assertTrue(is_computer_science("cs.LG stat.ML"))
+        self.assertFalse(is_computer_science("hep-th math.AG"))
 
     def test_embedding_jobs_are_resumable_and_content_aware(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,30 +78,95 @@ class MetadataTests(unittest.TestCase):
                 ),
                 2,
             )
-            self.assertEqual(
-                embed_pending(connection, index_dir, encoder),
-                0,
-            )
+            self.assertEqual(embed_pending(connection, index_dir, encoder), 0)
             upsert_papers(
                 connection,
                 [ArxivPaper("2", "Attention Geometry", "Updated abstract.")],
             )
-            self.assertEqual(
-                embed_pending(connection, index_dir, encoder),
-                1,
-            )
+            self.assertEqual(embed_pending(connection, index_dir, encoder), 1)
             connection.close()
 
-    def test_snapshot_allows_missing_abstract_but_rejects_missing_id(self):
+    def test_snapshot_filters_cs_and_allows_missing_abstract(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "metadata.json"
-            snapshot.write_text(json.dumps({"id": "1", "title": "Title"}) + "\n")
-            paper = next(iter_snapshot(snapshot))
-            self.assertEqual(paper.abstract, "")
+            snapshot.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "id": "1",
+                                "title": "Title",
+                                "categories": "cs.LG",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": "2",
+                                "title": "Physics",
+                                "abstract": "Abs",
+                                "categories": "hep-th",
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+            papers = list(iter_snapshot(snapshot, cs_only=True))
+            self.assertEqual(len(papers), 1)
+            self.assertEqual(papers[0].arxiv_id, "1")
+            self.assertEqual(papers[0].abstract, "")
 
             snapshot.write_text(json.dumps({"title": "Missing ID"}) + "\n")
             with self.assertRaises(KeyError):
-                next(iter_snapshot(snapshot))
+                next(iter_snapshot(snapshot, cs_only=False))
+
+    def test_build_preload_writes_ready_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snap.jsonl"
+            snapshot.write_text(
+                json.dumps(
+                    {
+                        "id": "2001.00001",
+                        "title": "A",
+                        "abstract": "B",
+                        "categories": "cs.AI",
+                    }
+                )
+                + "\n"
+            )
+            local_dir = root / "preload"
+            ready = build_preload(snapshot, local_dir, cs_only=True)
+            self.assertEqual(ready["papers"], 1)
+            self.assertTrue((local_dir / "metadata.sqlite").is_file())
+            self.assertTrue((local_dir / "PRELOAD_READY.json").is_file())
+
+    def test_upload_preload_puts_expected_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_dir = Path(directory)
+            (local_dir / "metadata.sqlite").write_bytes(b"sqlite")
+            (local_dir / "PRELOAD_READY.json").write_text("{}")
+            client = MagicMock()
+            with patch.dict(
+                "os.environ",
+                {
+                    "NEBIUS_S3_BUCKET": "embedxiv-bucket",
+                    "NEBIUS_S3_ENDPOINT_URL": "https://example",
+                    "NEBIUS_S3_ACCESS_KEY_ID": "id",
+                    "NEBIUS_S3_SECRET_ACCESS_KEY": "secret",
+                },
+                clear=False,
+            ):
+                # Avoid real sqlite checkpoint on fake bytes: patch connect
+                with patch("datagen.preload_metadata.sqlite3.connect") as connect:
+                    conn = MagicMock()
+                    connect.return_value.__enter__.return_value = conn
+                    upload_preload(local_dir, client=client)
+            keys = [call.args[2] for call in client.upload_file.call_args_list]
+            self.assertEqual(
+                keys,
+                ["arxiv-index/metadata.sqlite", "arxiv-index/PRELOAD_READY.json"],
+            )
 
 
 @unittest.skipUnless(importlib.util.find_spec("faiss"), "faiss-cpu not installed")
