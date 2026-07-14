@@ -21,7 +21,7 @@ Paper or abstract
   → Qwen extraction: problem → claims → implementation details
   → hierarchy-aware query texts
   → SPECTER2 ad-hoc query embeddings
-  → local FAISS search over arXiv title-and-abstract embeddings
+  → FAISS search over corpus loaded from Nebius Object Storage
   → optional Semantic Scholar metadata enrichment
   → ranked candidates with query provenance
 ```
@@ -34,55 +34,49 @@ and extra fields.
 
 ### Vector queries
 
-`retrieve.py` generates:
+Starting from the extraction JSON, `search_candidates.py` turns each hierarchy
+node into
+one or more short search strings. SPECTER2's adhoc query adapter is trained for
+short raw text (Allen AI's example is `"Bidirectional transformers"`), not for
+labeled templates like `Problem:` / `Claim:`. So we map the extracted sentences
+themselves:
 
-- Problem: problem statement + domain + keywords.
-- Claim direct: problem context + claim.
-- Claim functional: problem context + functional role.
-- Detail direct: parent claim + concrete detail + role.
-- Detail alternative: parent claim + functional role, omitting the current
-  mechanism.
+- Problem direct: problem statement + domain + keywords.
+- Claim direct: claim sentence.
+- Claim functional: claim functional role.
+- Detail direct: implementation detail sentence.
+- Detail alternative: detail functional role only (same role, different
+  mechanism wording).
 
-No words are truncated. Each full contextual query is encoded with
-`allenai/specter2_adhoc_query`.
+Each string is encoded with `allenai/specter2_adhoc_query` into a 768-d query
+vector. Hits from all queries are merged and deduplicated by arXiv ID, with
+provenance of which query matched each paper.
 
 ### arXiv index
 
-`arxiv_index.py` encodes each arXiv title and abstract with the
-`allenai/specter2` proximity adapter. Both adapters share
-`allenai/specter2_base` and produce compatible 768-dimensional vectors.
-The documented SPECTER2 setup uses unnormalized vectors and L2 distance.
+Each indexed paper is `title [SEP] abstract`, encoded with the document adapter
+`allenai/specter2`. Queries use `allenai/specter2_adhoc_query`. Both adapters
+share `allenai/specter2_base` and produce compatible 768-d vectors. FAISS finds
+nearest neighbors by L2 distance on unnormalized vectors.
 
-The index builder provides:
-
-- Official arXiv OAI-PMH sample/update harvesting.
-- Local arXiv metadata-snapshot ingestion.
-- SQLite metadata, content hashes, and resumable embedding jobs.
-- Atomic NumPy embedding shards.
-- Exact `IndexFlatL2` validation indexes.
-- Configurable IVF and IVF-SQ8 indexes for the full corpus.
+The production index is arXiv computer science only (`set=cs`), title+abstract
+only — not full PDFs.
 
 ### Semantic Scholar
 
-Semantic Scholar is not the primary retriever. After vector search, arXiv IDs
-can be enriched through `POST /graph/v1/paper/batch` with citation, influence,
-venue, publication, and open-access metadata.
+Semantic Scholar is not a second search. After FAISS returns candidates, their
+arXiv IDs are looked up via `POST /graph/v1/paper/batch` (`ARXIV:<id>`) to attach
+citation counts, venue, publication date, fields of study, and open-access PDF
+links when available.
 
-Enrichment is batched, cached, retried conservatively, and optional. Missing or
-unavailable Semantic Scholar records never remove local arXiv results.
+Enrichment is batched, cached in SQLite, retried on 429/5xx, and optional
+(`--no-s2` or missing `S2_API_KEY`). Missing or unavailable S2 records never
+remove local arXiv results; title/abstract/URL from the index stay authoritative.
 
 ## Install
 
-Extraction only:
-
 ```bash
 python3 -m pip install -r requirements.txt
-```
-
-Vector indexing and retrieval:
-
-```bash
-python3 -m pip install -r requirements-index.txt
 ```
 
 Required `.env` values:
@@ -90,79 +84,63 @@ Required `.env` values:
 ```text
 NEBIUS_ENDPOINT_URL=...
 NEBIUS_ENDPOINT_TOKEN=...
+NEBIUS_S3_ENDPOINT_URL=https://storage.<region>.nebius.cloud
+NEBIUS_S3_REGION=<region>
+NEBIUS_S3_ACCESS_KEY_ID=...
+NEBIUS_S3_SECRET_ACCESS_KEY=...
+NEBIUS_S3_BUCKET=...
+NEBIUS_INDEX_PREFIX=arxiv-index
 S2_API_KEY=...
 ARXIV_USER_AGENT=EmbedXivResearchAgent/0.1 your-email@example.com
 ```
 
-`S2_API_KEY` is optional when retrieval is run with `--no-s2`.
+`S2_API_KEY` is optional when search is run with `--no-s2`.
+`NEBIUS_INDEX_PREFIX` must match the Object Storage path the Job publishes
+(default `arxiv-index`, same as `/output/arxiv-index` when the bucket is mounted
+at `/output`).
 
-## Build a real validation index
+## Nebius deployments
 
-Harvest approximately 1,000 real arXiv records and build an exact index:
+Two separate Nebius deployments — same pattern as each other: build an image,
+push it, create the resource in the Nebius UI.
 
-```bash
-python3 build_arxiv_index.py \
-  --oai-sample 1000 \
-  --from-date 2025-01-01 \
-  --set cs \
-  --index-dir data/arxiv-index \
-  --index-type flat
+### Qwen endpoint (`Dockerfile`)
+
+Always-on Ollama container with `qwen3:32b`. `extract_claims.py` calls it over
+the OpenAI-compatible API (`NEBIUS_ENDPOINT_URL` / `NEBIUS_ENDPOINT_TOKEN`).
+
+### SPECTER2 corpus Job (`datagen/`)
+
+One-shot GPU Job that builds the searchable arXiv index. Image entrypoint is
+`python -m datagen.create_corpus`: harvest CS metadata → SPECTER2-embed
+title+abstract → build FAISS → verify → write artifacts under `/output`
+(mount your Object Storage bucket there in the Job UI).
+
+```text
+docker build -f datagen/Dockerfile -t <registry>/embedxiv-specter2:<tag> .
+docker push <registry>/embedxiv-specter2:<tag>
 ```
 
-Use `--device mps` on Apple silicon or `--device cuda` on a GPU machine.
-Harvesting is resumable and observes a three-second OAI request interval.
-If harvesting completed but embedding stopped, resume without downloading
-another metadata page:
+Then in Nebius: create a Job from that image, GPU node, bucket mounted at
+`/output`. The Job writes the corpus into Object Storage.
 
-```bash
-python3 build_arxiv_index.py \
-  --existing-metadata \
-  --index-dir data/arxiv-index \
-  --device mps
-```
+Search never uses a project-local index directory. `search_candidates.py` reads
+`LATEST.json` from the bucket over the S3 API and downloads that generation's
+FAISS artifacts for the query.
 
-## Build from the full metadata snapshot
-
-```bash
-python3 build_arxiv_index.py \
-  --metadata-jsonl /path/to/arxiv-metadata-oai-snapshot.json \
-  --index-dir data/arxiv-index \
-  --device cuda \
-  --index-type ivf
-```
-
-Benchmark a sample before starting the full build. At roughly 3.1 million
-papers:
-
-- Float32 vectors alone occupy about 8.9 GiB.
-- `IVF4096,SQ8` can reduce index memory to roughly 2.2 GiB with a recall cost.
-- Full CPU embedding is likely a multi-day operation.
-
-The full embedding job is suited to a Nebius GPU. Persist the generated
-SQLite, shard, manifest, and FAISS files in durable object storage after the
-job. Supabase/pgvector can replace FAISS later, but storing and indexing
-millions of 768-dimensional vectors requires a paid database tier and does not
-improve embedding quality.
-
-The SPECTER2 model cache itself uses several gigabytes. On macOS, query
-encoding runs in a worker process because PyTorch and FAISS can otherwise
-conflict through their OpenMP runtimes.
-
-## Run retrieval
+## Run search (after the corpus Job has published)
 
 Use an existing extraction:
 
 ```bash
-python3 retrieve.py grokking_paper_claims.json \
-  --index-dir data/arxiv-index \
+python3 search_candidates.py grokking_paper_claims.json \
   --output grokking_vector_results.json
 ```
 
-Run extraction and retrieval together:
+Run extraction and search together:
 
 ```bash
 python3 embedxiv_main.py papers/Grokking_paper.pdf \
-  --index-dir data/arxiv-index \
   --output grokking_vector_results.json
 ```
 
@@ -178,16 +156,41 @@ Each candidate contains:
 `grokking_retrieval_results.json` is stale output from the retired Semantic
 Scholar keyword retriever.
 
+## Source files
+
+| File | Role |
+| --- | --- |
+| `extract_claims.py` | Client: call Nebius Qwen → problem/claim/detail JSON |
+| `search_candidates.py` | Load corpus from Object Storage, SPECTER2/FAISS search, optional S2 |
+| `embedxiv_main.py` | Glue CLI: PDF/text → extract → search |
+| `datagen/create_corpus.py` | Job only: harvest, embed, build FAISS, publish to Object Storage |
+| `datagen/Dockerfile` | Nebius image for the corpus Job |
+| `Dockerfile` | Nebius image for the Qwen/Ollama endpoint |
+
 ## Remaining stages
 
-Dense retrieval finds related papers, not argumentative stance. The next stage
-must use Qwen to classify candidates as:
+Not implemented yet. Planned agentic loop after FAISS candidates:
+
+```text
+FAISS candidates (title + abstract)
+  → Qwen 32b judge: keep / drop + short why
+  → optional second pass: rewrite query or fetch more neighbors / full text
+  → Semantic Scholar enrich survivors only
+  → rank and present
+```
+
+Qwen runs on the existing Nebius Ollama endpoint (`qwen3:32b`). It decides
+autonomously, per candidate and per hierarchy level, whether to keep a paper as:
 
 - Same-problem competitor or foundation.
 - Claim support, extension, qualification, or contradiction.
 - Implementation alternative.
-- Irrelevant.
+- Irrelevant (drop).
 
-Full-text fetching and final suggestion-card ranking are not yet implemented.
-arXiv-only retrieval also excludes journal-only and substantial biomedical
-literature; another corpus can be added behind the same query interface later.
+If the first pass is thin, Qwen may request another retrieval round (reformulated
+query text, more neighbors, or full-text for a few keepers). Semantic Scholar
+runs only after judgment, for citation/venue metadata on survivors — not during
+search. Final ranking and suggestion cards use the kept set.
+
+arXiv-only retrieval excludes journal-only and substantial biomedical literature;
+another corpus can be added behind the same query interface later.

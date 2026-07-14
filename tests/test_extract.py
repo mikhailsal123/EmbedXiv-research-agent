@@ -1,3 +1,5 @@
+"""Tests for Qwen extraction schema and extract_claims helpers."""
+
 import unittest
 from types import SimpleNamespace
 

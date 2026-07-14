@@ -1,8 +1,17 @@
-"""Build and query a local arXiv index with asymmetric SPECTER2 embeddings."""
+"""Create the arXiv CS SPECTER2 corpus and publish it to Nebius Object Storage.
+
+Dataset generation only: harvest → embed → FAISS → verify → /output.
+Search/loading lives in search_candidates.py.
+
+Nebius Job entrypoint:
+
+  python -m datagen.create_corpus
+"""
 
 from __future__ import annotations
 
 import hashlib
+import shutil
 import json
 import os
 import random
@@ -13,6 +22,7 @@ import time
 import traceback
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol, Sequence
 
@@ -387,7 +397,7 @@ class Specter2Encoder:
             from transformers import AutoTokenizer
         except ImportError as exc:
             raise RuntimeError(
-                "Install requirements-index.txt to use SPECTER2"
+                "Install requirements.txt to use SPECTER2"
             ) from exc
 
         base_revision = _resolve_revision(BASE_MODEL, revision)
@@ -469,82 +479,6 @@ class Specter2Encoder:
     ) -> np.ndarray:
         return self._encode(texts, adapter=self.query_adapter, batch_size=batch_size)
 
-
-def _query_worker_main(
-    connection: object, device: str | None, revision: str
-) -> None:
-    try:
-        encoder = Specter2Encoder(device=device, revision=revision)
-        connection.send(("ready", encoder.dimension, encoder.fingerprint))
-        while True:
-            request = connection.recv()
-            if request is None:
-                return
-            texts, batch_size = request
-            vectors = encoder.encode_queries(texts, batch_size=batch_size)
-            connection.send(("ok", vectors))
-    except Exception:
-        connection.send(("error", traceback.format_exc()))
-    finally:
-        connection.close()
-
-
-class Specter2QueryWorker:
-    """Keep PyTorch outside the FAISS process on macOS."""
-
-    dimension = DIMENSION
-
-    def __init__(
-        self, *, device: str | None = None, revision: str = "main"
-    ) -> None:
-        import multiprocessing
-
-        context = multiprocessing.get_context("spawn")
-        parent, child = context.Pipe()
-        self._connection = parent
-        self._process = context.Process(
-            target=_query_worker_main,
-            args=(child, device, revision),
-            daemon=True,
-        )
-        self._process.start()
-        child.close()
-        status, *payload = self._connection.recv()
-        if status != "ready":
-            self.close()
-            raise RuntimeError(f"SPECTER2 query worker failed:\n{payload[0]}")
-        dimension, self.fingerprint = payload
-        if dimension != self.dimension:
-            self.close()
-            raise ValueError("Unexpected SPECTER2 query dimension")
-
-    def encode_documents(
-        self, texts: Sequence[str], batch_size: int
-    ) -> np.ndarray:
-        raise NotImplementedError("Query worker cannot encode documents")
-
-    def encode_queries(
-        self, texts: Sequence[str], batch_size: int
-    ) -> np.ndarray:
-        self._connection.send((list(texts), batch_size))
-        status, payload = self._connection.recv()
-        if status != "ok":
-            raise RuntimeError(f"SPECTER2 query worker failed:\n{payload}")
-        return payload
-
-    def close(self) -> None:
-        if getattr(self, "_connection", None) is not None:
-            try:
-                if self._process.is_alive():
-                    self._connection.send(None)
-            except (BrokenPipeError, EOFError):
-                pass
-            self._process.join(timeout=10)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=5)
-            self._connection.close()
-            self._connection = None
 
 
 def _next_shard_number(shard_dir: Path) -> int:
@@ -720,7 +654,7 @@ def build_faiss_index(
     try:
         import faiss
     except ImportError as exc:
-        raise RuntimeError("Install requirements-index.txt to use FAISS") from exc
+        raise RuntimeError("Install requirements.txt to use FAISS") from exc
 
     rows, fingerprint = _current_embedding_rows(connection)
 
@@ -778,96 +712,129 @@ def build_faiss_index(
     return manifest
 
 
-class ArxivIndex:
-    def __init__(
-        self,
-        index_dir: Path,
-        *,
-        encoder: Encoder | None = None,
-        device: str | None = None,
-        query_batch_size: int = 32,
-    ) -> None:
-        self._owns_encoder = encoder is None
-        if encoder is not None:
-            self.encoder = encoder
-        elif sys.platform == "darwin":
-            self.encoder = Specter2QueryWorker(device=device)
-        else:
-            self.encoder = Specter2Encoder(device=device)
-        self.index_dir = index_dir
-        self.connection = connect_database(index_dir)
-        self.manifest = json.loads((index_dir / "manifest.json").read_text())
-        self.index = None
-        self.query_batch_size = query_batch_size
-        if self.encoder.dimension != self.manifest["dimension"]:
-            raise ValueError("Query encoder and index dimensions differ")
-        if self.encoder.fingerprint != self.manifest["model_fingerprint"]:
-            raise ValueError("Query encoder and index model revisions differ")
 
-    def _load_index(self) -> None:
-        if self.index is not None:
-            return
-        try:
-            import faiss
-        except ImportError as exc:
-            raise RuntimeError("Install requirements-index.txt to use FAISS") from exc
-        self.index = faiss.read_index(str(self.index_dir / "index.faiss"))
+WORK_DIR = Path(os.getenv("INDEX_WORK_DIR", "/workspace/arxiv-index"))
+OUTPUT_DIR = Path(os.getenv("INDEX_OUTPUT_DIR", "/output/arxiv-index"))
 
-    def close(self) -> None:
-        self.connection.close()
-        if self._owns_encoder and hasattr(self.encoder, "close"):
-            self.encoder.close()
 
-    def __enter__(self) -> "ArxivIndex":
-        return self
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
 
-    def search(self, query_texts: Sequence[str], k: int = 20) -> list[list[dict]]:
-        if not query_texts:
-            return []
-        if k < 1:
-            raise ValueError("k must be positive")
-        vectors = self.encoder.encode_queries(
-            query_texts, batch_size=self.query_batch_size
+def verify(index_dir: Path) -> dict:
+    manifest_path = index_dir / "manifest.json"
+    index_path = index_dir / "index.faiss"
+    database_path = index_dir / "metadata.sqlite"
+    for path in (manifest_path, index_path, database_path):
+        if not path.is_file():
+            raise RuntimeError(f"Missing artifact: {path}")
+
+    manifest = json.loads(manifest_path.read_text())
+    with sqlite3.connect(database_path) as connection:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        papers = connection.execute(
+            "SELECT COUNT(*) FROM papers WHERE deleted = 0"
+        ).fetchone()[0]
+        embeddings = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM papers p
+            JOIN embedding_jobs j ON p.vector_id = j.vector_id
+            WHERE p.deleted = 0
+              AND j.status = 'done'
+              AND p.content_hash = j.content_hash
+            """
+        ).fetchone()[0]
+
+    import faiss
+
+    indexed = faiss.read_index(str(index_path)).ntotal
+    expected = manifest["paper_count"]
+    if integrity != "ok":
+        raise RuntimeError(f"SQLite integrity check failed: {integrity}")
+    if not (papers == embeddings == indexed == expected):
+        raise RuntimeError(
+            "Count mismatch: "
+            f"papers={papers}, embeddings={embeddings}, "
+            f"indexed={indexed}, manifest={expected}"
         )
-        # Encode first: loading FAISS before PyTorch inference can crash on macOS
-        # because both packages bring their own OpenMP runtime.
-        self._load_index()
-        distances, ids = self.index.search(vectors, k)
-        output = []
-        for query_distances, query_ids in zip(distances, ids):
-            valid_ids = [int(value) for value in query_ids if value >= 0]
-            metadata = {}
-            if valid_ids:
-                placeholders = ",".join("?" for _ in valid_ids)
-                rows = self.connection.execute(
-                    f"""
-                    SELECT vector_id, arxiv_id, title, abstract, categories,
-                           authors, license, datestamp
-                    FROM papers
-                    WHERE vector_id IN ({placeholders}) AND deleted = 0
-                    """,
-                    valid_ids,
-                ).fetchall()
-                metadata = {row["vector_id"]: dict(row) for row in rows}
+    return {
+        **manifest,
+        "sqlite_integrity": integrity,
+        "verified_paper_count": papers,
+    }
 
-            hits = []
-            for rank, (distance, vector_id) in enumerate(
-                zip(query_distances, query_ids), start=1
-            ):
-                vector_id = int(vector_id)
-                if vector_id < 0 or vector_id not in metadata:
-                    continue
-                hit = metadata[vector_id]
-                hit.update(
-                    {
-                        "distance": float(distance),
-                        "rank": rank,
-                        "url": f"https://arxiv.org/abs/{hit['arxiv_id']}",
-                    }
-                )
-                hits.append(hit)
-            output.append(hits)
-        return output
+
+def publish(index_dir: Path, summary: dict) -> Path:
+    generation = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = OUTPUT_DIR / "generations" / generation
+    destination.mkdir(parents=True, exist_ok=False)
+
+    artifacts = [
+        path
+        for path in sorted(index_dir.rglob("*"))
+        if path.is_file()
+        and not path.name.endswith((".tmp", ".sqlite-shm", ".sqlite-wal"))
+    ]
+    checksums = {}
+    for source in artifacts:
+        relative = source.relative_to(index_dir)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        source_digest = digest(source)
+        if digest(target) != source_digest:
+            raise RuntimeError(f"Published checksum mismatch: {relative}")
+        checksums[str(relative)] = source_digest
+
+    (destination / "checksums.sha256.json").write_text(
+        json.dumps(checksums, indent=2, sort_keys=True) + "\n"
+    )
+    success = {
+        **summary,
+        "generation": generation,
+        "artifact_count": len(checksums),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (destination / "SUCCESS.json").write_text(json.dumps(success, indent=2) + "\n")
+    (OUTPUT_DIR / "LATEST.json").write_text(json.dumps(success, indent=2) + "\n")
+    return destination
+
+
+def main() -> None:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    connection = connect_database(WORK_DIR)
+    try:
+        print("Harvesting the arXiv computer-science corpus", flush=True)
+        harvested = harvest_oai(connection, max_records=None, set_spec="cs")
+
+        encoder = Specter2Encoder(device="cuda")
+        embedded = embed_pending(
+            connection,
+            WORK_DIR,
+            encoder,
+            batch_size=int(os.getenv("EMBED_BATCH_SIZE", "128")),
+            shard_size=int(os.getenv("SHARD_SIZE", "50000")),
+        )
+        print(f"Embedded {embedded:,} papers", flush=True)
+        build_faiss_index(
+            connection,
+            WORK_DIR,
+            index_type=os.getenv("INDEX_TYPE", "ivf-sq8"),
+        )
+    finally:
+        connection.close()
+
+    summary = verify(WORK_DIR)
+    destination = publish(WORK_DIR, summary)
+    print(f"Published verified generation to {destination}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,21 @@
+"""Tests for SPECTER2 query mapping, FAISS candidate search, and S2 enrichment."""
+
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from arxiv_index import connect_database
 from extract_claims import (
     ConceptualClaim,
     ImplementationDetail,
     ResearchProblem,
 )
-from retrieve import (
+from search_candidates import (
     build_queries,
+    connect_database,
     enrich_semantic_scholar,
-    retrieve_candidates,
+    search_candidates,
+    specter2_query_text,
 )
 
 
@@ -73,8 +76,15 @@ class FakeSession:
 
 
 class QueryGenerationTests(unittest.TestCase):
-    def test_builds_contextual_problem_claim_and_detail_queries(self):
-        queries = build_queries(sample_problem())
+    def test_specter2_query_text_joins_raw_sentences(self):
+        self.assertEqual(
+            specter2_query_text("First idea", "computer vision", "a, b"),
+            "First idea. computer vision. a, b.",
+        )
+
+    def test_builds_specter2_style_problem_claim_and_detail_queries(self):
+        problem = sample_problem()
+        queries = build_queries(problem)
 
         self.assertEqual(len(queries), 5)
         self.assertEqual(
@@ -85,15 +95,32 @@ class QueryGenerationTests(unittest.TestCase):
             [query.query_type for query in queries],
             ["direct", "direct", "functional", "direct", "alternative"],
         )
-        self.assertIn("CNN feature maps contain", queries[0].query)
-        self.assertIn("Problem:", queries[1].query)
-        self.assertIn("Claim:", queries[1].query)
         self.assertEqual(
-            queries[2].source_text,
+            queries[0].query,
+            specter2_query_text(
+                problem.problem,
+                problem.domain,
+                ", ".join(problem.keywords),
+            ),
+        )
+        self.assertEqual(
+            queries[1].query,
+            "Channel and spatial selection improves representations.",
+        )
+        self.assertEqual(
+            queries[2].query,
             "Selects useful information at two granularities.",
         )
-        self.assertIn("Desired implementation role:", queries[4].query)
-        self.assertNotIn("Implementation detail:", queries[4].query)
+        self.assertEqual(
+            queries[3].query,
+            "Apply channel attention followed by spatial attention.",
+        )
+        self.assertEqual(
+            queries[4].query,
+            "Refines one dimension before another.",
+        )
+        self.assertNotIn("Problem:", queries[0].query)
+        self.assertNotIn("Claim:", queries[1].query)
 
     def test_deduplication_preserves_vector_matches(self):
         paper = {
@@ -105,7 +132,7 @@ class QueryGenerationTests(unittest.TestCase):
         }
         index = FakeVectorIndex([[paper] for _ in range(5)])
 
-        candidates = retrieve_candidates(sample_problem(), index)
+        candidates = search_candidates(sample_problem(), index)
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["arxiv_id"], "2001.01072")
@@ -159,8 +186,8 @@ class SemanticScholarEnrichmentTests(unittest.TestCase):
         self.assertEqual(result[0]["title"], "Local result")
         self.assertEqual(result[0]["semantic_scholar"]["status"], "not_found")
 
-    @patch("retrieve.time.sleep")
-    @patch("retrieve.random.uniform", return_value=0)
+    @patch("search_candidates.time.sleep")
+    @patch("search_candidates.random.uniform", return_value=0)
     def test_retries_transient_batch_failure(self, _random, sleep):
         session = FakeSession(
             [

@@ -1,10 +1,10 @@
 """
 Step 1: Extract problems, conceptual claims, and implementation details into a schema.
 
-A problem states the paper's main research subject. Claims state the new ideas 
-used to address it. Implementation details describe how each claim is realized.
+Calls qwen3:32b on the Nebius endpoint and validates the
+result with a Pydantic schema.
 
-Set env vars first:
+Env:
   NEBIUS_ENDPOINT_URL
   NEBIUS_ENDPOINT_TOKEN
 """

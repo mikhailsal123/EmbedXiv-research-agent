@@ -1,4 +1,8 @@
-"""Run extraction and local arXiv vector retrieval end to end."""
+"""Extract problems/claims/details with Qwen, then FAISS-search related arXiv papers.
+
+Glue CLI for extract_claims.py + search_candidates.py. The SPECTER2/FAISS corpus
+is loaded from Nebius Object Storage (published by datagen.create_corpus).
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,12 @@ import argparse
 import json
 from pathlib import Path
 
-from arxiv_index import ArxivIndex
 from extract_claims import extract_claims, read_pdf_text
-from retrieve import (
+from search_candidates import (
     DEFAULT_REQUEST_DELAY,
     TOP_K_PER_QUERY,
-    retrieve_all_candidates,
+    open_index,
+    search_all_candidates,
 )
 
 
@@ -23,10 +27,9 @@ def read_input(path: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract a research structure and retrieve related papers."
+        description="Extract a research structure and search related arXiv papers."
     )
     parser.add_argument("input", help="PDF or UTF-8 text file")
-    parser.add_argument("--index-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"])
     parser.add_argument("-o", "--output", default="research_results.json")
     parser.add_argument("--limit", type=int, default=TOP_K_PER_QUERY)
@@ -41,8 +44,8 @@ def main() -> None:
     input_path = Path(args.input)
     paper_text = read_input(input_path)
     problems = extract_claims(paper_text)
-    with ArxivIndex(args.index_dir, device=args.device) as index:
-        candidates = retrieve_all_candidates(
+    with open_index(device=args.device) as index:
+        candidates = search_all_candidates(
             problems,
             index,
             limit=args.limit,

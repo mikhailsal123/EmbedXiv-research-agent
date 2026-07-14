@@ -1,3 +1,5 @@
+"""Tests for arXiv harvest, SPECTER2 embedding jobs, and FAISS search."""
+
 import importlib.util
 import json
 import tempfile
@@ -6,9 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from arxiv_index import (
+from datagen.create_corpus import (
     DIMENSION,
-    ArxivIndex,
     ArxivPaper,
     build_faiss_index,
     canonical_arxiv_id,
@@ -18,6 +19,7 @@ from arxiv_index import (
     parse_oai_page,
     upsert_papers,
 )
+from search_candidates import ArxivIndex
 
 
 class FakeEncoder:
