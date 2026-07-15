@@ -12,7 +12,7 @@ import webbrowser
 from pathlib import Path
 
 from extract_claims import extract_claims, read_pdf_text
-from judge_candidates import kept_candidates, judge_candidates
+from judge_candidates import cap_kept_candidates_per_node, kept_candidates, judge_candidates
 from search_refinement import (
     DEFAULT_REFINEMENT_FOLLOWUPS_PER_TARGET,
     DEFAULT_REFINEMENT_LIMIT,
@@ -291,6 +291,10 @@ def main() -> None:
                     candidates.extend(judged_recs)
                 else:
                     print("No S2 recommendations to judge.", flush=True)
+
+            print("Capping kept suggestions per source node…", flush=True)
+            candidates = cap_kept_candidates_per_node(problems, candidates)
+            _print_judge_summary("After per-node cap", candidates)
 
     kept = sum(
         1

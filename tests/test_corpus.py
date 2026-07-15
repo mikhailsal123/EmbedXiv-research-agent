@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+import datagen.embed_corpus as embed_corpus
 from datagen.embed_corpus import (
     DIMENSION,
     build_faiss_index,
@@ -17,6 +18,8 @@ from datagen.embed_corpus import (
     parse_cuda_devices,
     normalize_database_url,
     pg_vector_literal,
+    restore_embed_checkpoint,
+    save_embed_checkpoint,
     _contiguous_chunks,
 )
 from datagen.preload_metadata import (
@@ -48,6 +51,27 @@ class FakeEncoder:
 
     def encode_queries(self, texts, batch_size):
         return self._vectors(texts)
+
+
+class FakeMainConnection:
+    def __init__(self):
+        self.closed = False
+
+    def execute(self, sql):
+        if "JOIN embedding_jobs" in sql:
+            return SimpleRow((2,))
+        return SimpleRow((2,))
+
+    def close(self):
+        self.closed = True
+
+
+class SimpleRow:
+    def __init__(self, row):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
 
 
 class PostgresUrlTests(unittest.TestCase):
@@ -89,6 +113,86 @@ class PgVectorLiteralTests(unittest.TestCase):
     def test_pg_vector_literal_formats_floats(self):
         vector = np.array([0.1, 1.0, -2.5], dtype=np.float32)
         self.assertEqual(pg_vector_literal(vector), "[0.1,1,-2.5]")
+
+
+class EmbedCheckpointTests(unittest.TestCase):
+    def test_checkpoint_save_and_restore_copy_file_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "output"
+            work_dir = root / "work"
+            restore_dir = root / "restore"
+            shard_dir = work_dir / "shards" / "nested"
+            shard_dir.mkdir(parents=True)
+            (work_dir / "metadata.sqlite").write_bytes(b"sqlite")
+            (shard_dir / "embeddings.npy").write_bytes(b"vectors")
+
+            with patch("datagen.embed_corpus.OUTPUT_DIR", output_dir):
+                save_embed_checkpoint(work_dir)
+                self.assertTrue(restore_embed_checkpoint(restore_dir))
+
+            self.assertTrue(
+                (output_dir / "embed-checkpoint" / "CHECKPOINT_READY.json").is_file()
+            )
+            self.assertEqual((restore_dir / "metadata.sqlite").read_bytes(), b"sqlite")
+            self.assertEqual(
+                (restore_dir / "shards" / "nested" / "embeddings.npy").read_bytes(),
+                b"vectors",
+            )
+
+    def test_restore_ignores_partial_checkpoint_without_ready_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "output"
+            checkpoint = output_dir / "embed-checkpoint"
+            shard_dir = checkpoint / "shards"
+            shard_dir.mkdir(parents=True)
+            (checkpoint / "metadata.sqlite").write_bytes(b"partial")
+            (shard_dir / "embeddings.npy").write_bytes(b"partial")
+
+            with patch("datagen.embed_corpus.OUTPUT_DIR", output_dir):
+                self.assertFalse(restore_embed_checkpoint(root / "restore"))
+
+    def test_main_continues_to_postgres_publish_when_checkpoint_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "output"
+            work_dir = root / "work"
+            output_dir.mkdir()
+            (output_dir / "metadata.sqlite").write_bytes(b"sqlite")
+            (output_dir / "PRELOAD_READY.json").write_text("{}")
+            connection = FakeMainConnection()
+            encoder = MagicMock(fingerprint="fake-fingerprint")
+
+            with (
+                patch.object(embed_corpus, "OUTPUT_DIR", output_dir),
+                patch.object(embed_corpus, "WORK_DIR", work_dir),
+                patch.object(embed_corpus, "database_url", return_value="postgres://db"),
+                patch.object(embed_corpus, "probe_postgres"),
+                patch.object(embed_corpus, "restore_embed_checkpoint", return_value=False),
+                patch.object(embed_corpus, "connect_database", return_value=connection),
+                patch.object(embed_corpus, "create_document_encoder", return_value=encoder),
+                patch.object(embed_corpus, "embed_pending", return_value=2),
+                patch.object(
+                    embed_corpus,
+                    "save_embed_checkpoint",
+                    side_effect=PermissionError("bucket mount rejected metadata copy"),
+                ),
+                patch.object(
+                    embed_corpus,
+                    "publish_postgres",
+                    return_value={"paper_count": 2},
+                ) as publish_postgres,
+                patch.object(
+                    embed_corpus,
+                    "verify_postgres",
+                    return_value={"paper_count": 2},
+                ),
+            ):
+                embed_corpus.main()
+
+            publish_postgres.assert_called_once()
+            self.assertTrue(connection.closed)
 
 
 class MultiGpuEncoderSelectionTests(unittest.TestCase):

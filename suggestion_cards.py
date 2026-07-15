@@ -196,6 +196,16 @@ def resolve_attachment(
 ) -> dict[str, Any]:
     """Attach a candidate to one source problem / claim / detail node."""
     normalized = [_as_dict(problem) for problem in (problems or [])]
+    frozen = candidate.get("attachment")
+    if isinstance(frozen, dict) and frozen.get("node_kind") is not None:
+        return _lookup_node(
+            normalized,
+            primary_level=str(frozen["node_kind"]),
+            problem_index=_safe_int(frozen.get("problem_index")) or 0,
+            claim_index=_safe_int(frozen.get("claim_index")),
+            detail_index=_safe_int(frozen.get("detail_index")),
+        )
+
     judgment = candidate.get("judgment") or {}
     primary_level = judgment.get("primary_level") or "problem"
     if primary_level not in LEVEL_TO_QUERY_LEVEL:

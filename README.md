@@ -2,13 +2,26 @@
 
 ## Purpose
 
-Given a private abstract, preprint, or paper, extract:
+CS/AI moves too quickly for authors to read every relevant new paper before
+submitting their own work. EmbedXiv is a literature-aware paper proofreader: it
+reads a draft, searches a CS arXiv corpus, and surfaces papers that may expose
+gaps in the draft.
+
+Those gaps can look like:
+
+- a closely related paper the author should position against;
+- an alternative architecture or mechanism that may fit the author's goal
+  better than the one in the draft;
+- a paper that tested, qualified, contradicted, or extended a claim the author
+  is making.
+
+Given a private abstract, preprint, or paper, the pipeline extracts:
 
 - **Problem**: the limitation or research gap.
 - **Claims**: independent conceptual ideas addressing that problem.
 - **Implementation details**: concrete mechanisms realizing each claim.
 
-Search for useful research at each level:
+It then searches for papers that can help proofread those parts of the draft:
 
 1. Papers addressing the same problem.
 2. Ideas that support, extend, qualify, or challenge each claim.
@@ -61,9 +74,9 @@ provenance of which query matched each paper.
 `search_refinement.py` runs during `embedxiv_main.py` after the initial vector
 search and before the first judge pass. It uses the active vector backend:
 Postgres/pgvector in the current production path, or the legacy FAISS fallback
-when `DATABASE_URL` is unset. Its goal is narrow: find papers whose mechanism,
-architecture, or claim could replace a source claim/detail for the same
-functional role.
+when `DATABASE_URL` is unset. Its goal is narrow: find papers that reveal a
+possible draft gap, especially papers whose mechanism, architecture, or tested
+claim could replace, qualify, or strengthen a source claim/detail.
 
 It is agentic because it closes the retrieval loop: it inspects search quality,
 diagnoses why results are too generic, too close to the source, or off-role,
@@ -109,7 +122,28 @@ run through the **same two-stage judge**. Use `--no-s2` to skip.
 The older batch metadata enrich helper still exists in `search_candidates.py`
 but is not part of the default `embedxiv_main` path.
 
+## Reproduce from scratch
+
+Full order of operations for a clean machine and a fresh Nebius project:
+
+1. Install dependencies and create `.env` — [Reproduce the environment](#reproduce-the-environment).
+2. Deploy the Qwen endpoint on Nebius — [Qwen endpoint](#qwen-endpoint-dockerfile). Put its
+   URL and token in `.env`.
+3. Create the Managed Postgres database, enable pgvector, and set
+   `DATABASE_URL` in `.env` — [Managed Postgres (pgvector)](#managed-postgres-pgvector).
+4. Download the Kaggle arXiv snapshot into `data/` — [Data](#data).
+5. Run the laptop preload to build `metadata.sqlite` and upload it to Object
+   Storage — [Corpus build](#corpus-build-datagen), step 1.
+6. Build and push the GPU Job image, then run the Nebius GPU Job with
+   `DATABASE_URL` set and the bucket mounted at `/output` — [Corpus build](#corpus-build-datagen), step 2.
+7. Run the pipeline on the included synthetic example — [Run the pipeline](#run-the-pipeline).
+
+Steps 4–6 are one-time corpus setup. After the Job publishes to Postgres,
+day-to-day runs only need steps 1–2 configured.
+
 ## Reproduce the environment
+
+Requires Python 3.11+ (developed on 3.12).
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -154,7 +188,18 @@ Job containers (missing `/root/.postgresql/root.crt`).
 
 `S2_API_KEY` is optional when search is run with `--no-s2`.
 The Object Storage prefix is `arxiv-index` in bucket `embedxiv-storage` (for
-example `embedxiv-storage/arxiv-index/metadata.sqlite`).
+example `embedxiv-storage/arxiv-index/metadata.sqlite`). Override the prefix
+with `NEBIUS_INDEX_PREFIX`.
+
+Optional environment variables (all have sensible defaults):
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `EXTRACTION_MODEL` | `qwen3:32b` | Model name for claim extraction |
+| `JUDGE_MODEL` | `EXTRACTION_MODEL` value | Model name for the two-stage judge |
+| `JUDGE_PDF_MAX_CHARS` | `60000` | Truncation limit for full-text PDF judging |
+| `ARXIV_REQUEST_DELAY` | `1.0` | Seconds between arXiv PDF downloads |
+| `ARXIV_USER_AGENT` | dev placeholder | Set to your contact info per arXiv etiquette |
 
 ### Managed Postgres (pgvector)
 
@@ -232,6 +277,8 @@ The system uses two Nebius resources:
 
 Always-on Ollama container with `qwen3:32b`. `extract_claims.py` calls it over
 the OpenAI-compatible API (`NEBIUS_ENDPOINT_URL` / `NEBIUS_ENDPOINT_TOKEN`).
+Run it as a GPU-backed Serverless Endpoint sized to load `qwen3:32b`; endpoint
+GPU choice controls latency and hourly cost.
 
 Build and push the endpoint image from the repository root:
 
@@ -240,13 +287,28 @@ docker build --platform linux/amd64 -t <docker-user>/embedxiv-qwen:latest .
 docker push <docker-user>/embedxiv-qwen:latest
 ```
 
+Reference endpoint configuration:
+
+| Setting | Value |
+| --- | --- |
+| Image path | `<docker-user>/embedxiv-qwen:latest` |
+| Container command | default image entrypoint: `ollama serve` |
+| Exposed port | `11434` |
+| Model loaded in image | `qwen3:32b` |
+| Endpoint type | GPU-backed Nebius Serverless Endpoint |
+| Hardware | choose a GPU/memory shape large enough to load and serve `qwen3:32b` |
+| Client env vars | `NEBIUS_ENDPOINT_URL`, `NEBIUS_ENDPOINT_TOKEN` |
+
+Do not publish the endpoint URL token. `NEBIUS_ENDPOINT_URL` and
+`NEBIUS_ENDPOINT_TOKEN` belong in `.env` or in the deployment UI only.
+
 ### Corpus build (`datagen/`)
 
 Two steps — no live arXiv OAI crawl for the first build.
 
 **1. Laptop CPU preload** (`datagen/preload_metadata.py`)
 
-Use the Kaggle snapshot from [Dataset](#dataset) (`data/arxiv-metadata-oai-snapshot.json`).
+Use the Kaggle snapshot from [Data](#data) (`data/arxiv-metadata-oai-snapshot.json`).
 Build `metadata.sqlite` and upload to Object Storage under `arxiv-index/`:
 
 ```bash
@@ -269,8 +331,9 @@ docker push <docker-user>/embedxiv-specter2:latest
 ```
 
 Create a **new** GPU Job (Restart does not reliably pick up a new image digest).
-Use 1 GPU, 450+ GiB container disk, and a long timeout (72–168 hours for the
-full CS corpus).
+Use 1 GPU or more, 350+ GiB container disk for the current CS-only corpus path,
+and a timeout above the observed runtime. The current corpus build used for this
+project runs in about 2 hours on the reference 1-GPU RTX PRO 6000 Job.
 
 On multi-GPU nodes, the embed Job automatically uses all visible CUDA devices
 for SPECTER2 document embedding. Set `EMBED_CUDA_DEVICES=0,1` to restrict the
@@ -338,6 +401,32 @@ Success log line: `Published verified Postgres corpus (N papers)`.
 The image keeps CUDA PyTorch from the base layer (do not reinstall CPU `torch`
 from PyPI on top).
 
+### Reference Nebius Job configuration
+
+This is the Serverless AI Job configuration used for the corpus embedding run.
+Do not copy real database passwords into public docs; keep the real
+`DATABASE_URL` in the Nebius UI or local `.env` only.
+
+| Setting | Value |
+| --- | --- |
+| Image path | `msaleev/embedxiv-specter2:latest` |
+| Entrypoint command | `python -m datagen.embed_corpus` |
+| Timeout | `3 hours` |
+| Container disk | `350 GiB` |
+| Mounted bucket | `embedxiv-storage` |
+| Mount path | `/output` |
+| Environment variable | `DATABASE_URL=postgresql://...?...sslmode=verify-full` |
+| GPUs | `1 GPU` |
+| GPU platform | `NVIDIA RTX PRO 6000` (`gpu-rtx6000`) |
+| CPUs | `24 vCPUs` |
+| Memory | `218 GiB` |
+| VM type | `Regular` |
+
+The job expects the preload files at `/output/arxiv-index/metadata.sqlite` and
+`/output/arxiv-index/PRELOAD_READY.json`. With `DATABASE_URL` set, it publishes
+metadata and 768-d SPECTER2 vectors into Managed Postgres/pgvector instead of
+publishing a FAISS generation to Object Storage.
+
 ### Expected runtime and cost shape
 
 Actual cost depends on the Nebius region, GPU type, endpoint uptime, Managed
@@ -350,11 +439,11 @@ resource prices:
   full-text judging.
 - Laptop preload: usually CPU-bound local work over the Kaggle JSONL snapshot;
   the output is `metadata.sqlite` plus `PRELOAD_READY.json` in Object Storage.
-- Corpus GPU Job: the full arXiv CS corpus can take about 72-168 hours on one
-  GPU with a 450+ GiB container disk. Multi-GPU nodes split embedding batches
-  across visible CUDA devices and should reduce wall time roughly with usable
-  GPU throughput.
-- Per-paper pipeline run: writes `output/full_run_results.json`,
+- Corpus GPU Job: the current CS corpus build used here takes about 2 hours on
+  one NVIDIA RTX PRO 6000 GPU with a 350 GiB container disk. Multi-GPU nodes
+  split embedding batches across visible CUDA devices and should reduce wall
+  time roughly with usable GPU throughput.
+- Per-draft pipeline run: writes `output/full_run_results.json`,
   `output/full_run_results_cards.html`, and
   `output/full_run_results_cards.md`; runtime is dominated by Qwen judge calls
   and the number of candidate PDFs that pass the abstract screen.
@@ -392,13 +481,13 @@ python3 embedxiv_main.py path/to/local_paper.pdf
 By default this writes all generated files into `output/`:
 
 - `full_run_results.json` — full pipeline dump
-- `full_run_results_cards.html` / `.md` — suggestion cards
+- `full_run_results_cards.html` / `.md` — paper-proofreading suggestion cards
 
 The HTML opens automatically in the default browser after a successful run.
 Use `--no-open` to suppress that behavior. Override the destination with
 `-o path/to/custom_results.json`; card sidecars are written beside it.
 
-Add `--no-s2` to disable metadata enrichment.
+Add `--no-s2` to disable Semantic Scholar graph recommendations.
 Add `--no-search-refinement` to disable the bounded agentic substitute-search loop.
 
 Agentic search-refinement cost controls:
@@ -417,10 +506,20 @@ Each candidate contains:
 - arXiv metadata and URL.
 - Best vector distance and rank.
 - Every problem, claim, or detail query that matched it.
+- The judge's explanation of the draft gap or useful takeaway.
 - Optional nested Semantic Scholar metadata and enrichment status.
 
-`grokking_retrieval_results.json` is stale output from the retired Semantic
-Scholar keyword retriever.
+## Run the tests
+
+The suite is offline — no credentials, database, or GPU needed:
+
+```bash
+python3 -m pytest tests/
+```
+
+It covers extraction schema validation, query building, the pgvector/FAISS
+backend switch, judge parsing, card rendering, and repository hygiene (no
+tracked PDFs, datasets, or generated outputs; exactly pinned requirements).
 
 ## Source files
 

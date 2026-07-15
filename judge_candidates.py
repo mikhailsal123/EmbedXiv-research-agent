@@ -32,6 +32,7 @@ load_local_env()
 DEFAULT_JUDGE_MODEL = os.getenv("JUDGE_MODEL", os.getenv("EXTRACTION_MODEL", "qwen3:32b"))
 DEFAULT_PDF_MAX_CHARS = int(os.getenv("JUDGE_PDF_MAX_CHARS", "60000"))
 DEFAULT_ARXIV_DELAY = float(os.getenv("ARXIV_REQUEST_DELAY", "1.0"))
+DEFAULT_MAX_KEPT_PER_NODE = int(os.getenv("JUDGE_MAX_KEPT_PER_NODE", "5"))
 ARXIV_USER_AGENT = os.getenv(
     "ARXIV_USER_AGENT",
     "EmbedXivResearchAgent/0.1 (mailto:local-dev@example.com)",
@@ -112,13 +113,17 @@ class ScreenQueryResult(SchemaModel):
     judgments: list[ScreenJudgment] = Field(min_length=1)
 
 
+class NodeTopSelection(SchemaModel):
+    selected_arxiv_ids: list[str] = Field(default_factory=list, max_length=5)
+
+
 class CandidateJudgment(SchemaModel):
     arxiv_id: str = Field(min_length=1)
     decision: Decision
     relation: Relation
     why: str = Field(min_length=1, max_length=400)
     primary_level: PrimaryLevel = "problem"
-    stage: Literal["screen", "full_text"] = "full_text"
+    stage: Literal["screen", "full_text", "cap"] = "full_text"
 
     @field_validator("arxiv_id")
     @classmethod
@@ -207,6 +212,22 @@ Rules:
   already claim.
 - relation=irrelevant requires decision=drop.
 - Prefer drop on borderline matches.
+"""
+
+
+SELECT_SYSTEM_PROMPT = """You choose the most useful papers for ONE source node in
+the author's paper hierarchy (problem, claim, or implementation detail).
+
+You are given papers that already passed full-text judging for this node. Pick the
+0-5 papers the author should actually read. Prefer distinct, high-value takeaways
+over redundant near-duplicates.
+
+Rules:
+- Return at most 5 arxiv_ids.
+- It is valid to return fewer than 5, or none, if the survivors are weak or
+  redundant.
+- Do not invent ids.
+- Prefer papers with concrete, non-overlapping usefulness for this node.
 """
 
 
@@ -631,6 +652,298 @@ def judge_candidates(
     return output
 
 
+def _match_distance(match: dict[str, Any]) -> float:
+    try:
+        return float(match.get("distance"))
+    except (TypeError, ValueError):
+        return 1e9
+
+
+def _safe_index(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _node_descriptor(
+    problems: list[ResearchProblem],
+    attachment: dict[str, Any],
+) -> str:
+    pi = attachment["problem_index"]
+    ci = attachment.get("claim_index")
+    di = attachment.get("detail_index")
+    kind = attachment["node_kind"]
+    problem = problems[pi]
+    if kind == "problem":
+        return (
+            f"Problem[{pi}]\n"
+            f"text: {problem.problem}\n"
+            f"domain: {problem.domain}"
+        )
+    claim = problem.claims[ci]
+    if kind == "claim":
+        return (
+            f"Claim[{pi}.{ci}]\n"
+            f"text: {claim.claim}\n"
+            f"functional_role: {claim.functional_role}"
+        )
+    detail = claim.implementation_details[di]
+    return (
+        f"Implementation detail[{pi}.{ci}.{di}]\n"
+        f"text: {detail.detail}\n"
+        f"functional_role: {detail.functional_role}"
+    )
+
+
+def _attachment_options_from_matches(
+    candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for match in candidate.get("matched_queries") or []:
+        if not isinstance(match, dict):
+            continue
+        level = match.get("level")
+        if level not in ("problem", "claim", "implementation"):
+            continue
+        pi = _safe_index(match.get("problem_index"), 0)
+        ci = match.get("claim_index")
+        di = match.get("detail_index")
+        distance = _match_distance(match)
+        if level == "problem":
+            options.append(
+                {
+                    "node_kind": "problem",
+                    "node_path": str(pi),
+                    "problem_index": pi,
+                    "claim_index": None,
+                    "detail_index": None,
+                    "distance": distance,
+                }
+            )
+        elif level == "claim" and ci is not None:
+            ci = _safe_index(ci)
+            options.append(
+                {
+                    "node_kind": "claim",
+                    "node_path": f"{pi}.{ci}",
+                    "problem_index": pi,
+                    "claim_index": ci,
+                    "detail_index": None,
+                    "distance": distance,
+                }
+            )
+        elif (
+            level == "implementation"
+            and ci is not None
+            and di is not None
+        ):
+            ci = _safe_index(ci)
+            di = _safe_index(di)
+            options.append(
+                {
+                    "node_kind": "implementation",
+                    "node_path": f"{pi}.{ci}.{di}",
+                    "problem_index": pi,
+                    "claim_index": ci,
+                    "detail_index": di,
+                    "distance": distance,
+                }
+            )
+    return options
+
+
+def _pick_strongest_attachment(
+    candidate: dict[str, Any],
+    problems: list[ResearchProblem],
+) -> dict[str, Any]:
+    judgment = candidate.get("judgment") or {}
+    primary_level = judgment.get("primary_level") or "problem"
+    options = _attachment_options_from_matches(candidate)
+    if not options:
+        return {
+            "node_kind": primary_level
+            if primary_level in ("problem", "claim", "implementation")
+            else "problem",
+            "node_path": "0",
+            "problem_index": 0,
+            "claim_index": None,
+            "detail_index": None,
+            "distance": _match_distance({}),
+        }
+
+    def sort_key(option: dict[str, Any]) -> tuple:
+        level_match = 0 if option["node_kind"] == primary_level else 1
+        specificity = {
+            "implementation": 0,
+            "claim": 1,
+            "problem": 2,
+        }[option["node_kind"]]
+        return (level_match, option["distance"], specificity)
+
+    return min(options, key=sort_key)
+
+
+def _selection_candidate_block(candidate: dict[str, Any]) -> str:
+    judgment = candidate.get("judgment") or {}
+    return "\n".join(
+        [
+            f"arxiv_id: {candidate.get('arxiv_id', '')}",
+            f"title: {_truncate(str(candidate.get('title', '')), 300)}",
+            f"abstract: {_truncate(str(candidate.get('abstract', '')), 500)}",
+            f"relation: {judgment.get('relation', '')}",
+            f"why: {_truncate(str(judgment.get('why', '')), 300)}",
+            f"best_distance: {candidate.get('best_distance', '')}",
+        ]
+    )
+
+
+def select_top_candidates_for_node(
+    problems: list[ResearchProblem],
+    attachment: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_JUDGE_MODEL,
+    max_per_node: int = DEFAULT_MAX_KEPT_PER_NODE,
+) -> list[str]:
+    if not candidates:
+        return []
+    if len(candidates) <= max_per_node:
+        return [str(candidate.get("arxiv_id", "")).strip() for candidate in candidates]
+
+    allowed = {
+        str(candidate.get("arxiv_id", "")).strip(): candidate
+        for candidate in candidates
+        if str(candidate.get("arxiv_id", "")).strip()
+    }
+    user_parts = [
+        _extraction_context(problems),
+        "",
+        "SOURCE NODE",
+        _node_descriptor(problems, attachment),
+        "",
+        "KEPT CANDIDATES FOR THIS NODE",
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        user_parts.append(f"--- candidate {index} ---")
+        user_parts.append(_selection_candidate_block(candidate))
+    user_parts.append("")
+    user_parts.append(
+        f"Return at most {max_per_node} arxiv_ids for this node. Prefer distinct,"
+        " high-value papers and omit redundant near-duplicates."
+    )
+
+    try:
+        completion = (client or get_client()).beta.chat.completions.parse(
+            model=model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": SELECT_SYSTEM_PROMPT},
+                {"role": "user", "content": "\n".join(user_parts)},
+            ],
+            response_format=NodeTopSelection,
+        )
+        result = completion.choices[0].message.parsed
+        if result is None:
+            raise RuntimeError("The cap selector returned no structured result")
+        selected = [
+            arxiv_id
+            for arxiv_id in result.selected_arxiv_ids
+            if arxiv_id in allowed
+        ]
+        if selected:
+            return selected[:max_per_node]
+    except Exception:
+        pass
+
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.get("best_distance", 1e9),
+            candidate.get("best_rank", 10_000),
+            str(candidate.get("arxiv_id", "")),
+        ),
+    )
+    return [
+        str(candidate.get("arxiv_id", "")).strip()
+        for candidate in ranked[:max_per_node]
+        if str(candidate.get("arxiv_id", "")).strip()
+    ]
+
+
+def cap_kept_candidates_per_node(
+    problems: list[ResearchProblem],
+    candidates: list[dict[str, Any]],
+    *,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_JUDGE_MODEL,
+    max_per_node: int = DEFAULT_MAX_KEPT_PER_NODE,
+) -> list[dict[str, Any]]:
+    """Keep at most max_per_node distinct kept papers per source node."""
+    if max_per_node < 0:
+        raise ValueError("max_per_node must be >= 0")
+    if not problems:
+        raise ValueError("problems must not be empty")
+
+    kept_by_id = {
+        str(candidate.get("arxiv_id", "")).strip(): candidate
+        for candidate in candidates
+        if str(candidate.get("arxiv_id", "")).strip()
+        and (candidate.get("judgment") or {}).get("decision") == "keep"
+    }
+    if not kept_by_id:
+        return candidates
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    attachments: dict[str, dict[str, Any]] = {}
+    for candidate in kept_by_id.values():
+        attachment = _pick_strongest_attachment(candidate, problems)
+        node_path = attachment["node_path"]
+        attachments[str(candidate.get("arxiv_id", "")).strip()] = attachment
+        groups.setdefault(node_path, []).append(candidate)
+
+    selected_ids: set[str] = set()
+    for node_path, group in groups.items():
+        attachment = group[0]
+        attachment = attachments[str(group[0].get("arxiv_id", "")).strip()]
+        chosen = select_top_candidates_for_node(
+            problems,
+            attachment,
+            group,
+            client=client,
+            model=model,
+            max_per_node=max_per_node,
+        )
+        selected_ids.update(chosen)
+
+    output: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        arxiv_id = str(item.get("arxiv_id", "")).strip()
+        judgment = dict(item.get("judgment") or {})
+        if judgment.get("decision") != "keep":
+            output.append(item)
+            continue
+        if arxiv_id in selected_ids:
+            item["attachment"] = attachments.get(arxiv_id)
+            output.append(item)
+            continue
+        judgment.update(
+            {
+                "decision": "drop",
+                "stage": "cap",
+                "why": (
+                    f"Not among the top {max_per_node} distinct suggestions for "
+                    f"node {attachments.get(arxiv_id, {}).get('node_path', '?')}."
+                ),
+            }
+        )
+        item["judgment"] = judgment
+        output.append(item)
+    return output
+
+
 def kept_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         candidate
@@ -663,6 +976,7 @@ def main() -> None:
         candidates,
         fetch_pdfs=not args.no_pdf,
     )
+    judged = cap_kept_candidates_per_node(problems, judged)
     if args.kept_only:
         judged = kept_candidates(judged)
 

@@ -844,17 +844,35 @@ def checkpoint_dir() -> Path:
     return OUTPUT_DIR / "embed-checkpoint"
 
 
+def _copy_tree_contents(src: Path, dst: Path) -> None:
+    """Copy files without chmod/chown/utime calls unsupported by bucket mounts."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for source in src.rglob("*"):
+        target = dst / source.relative_to(src)
+        if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+
+
 def save_embed_checkpoint(work_dir: Path) -> Path:
     """Persist SQLite + shards onto the bucket mount so publish retries survive."""
     destination = checkpoint_dir()
     destination.mkdir(parents=True, exist_ok=True)
+    ready = destination / "CHECKPOINT_READY.json"
+    if ready.exists():
+        ready.unlink()
+    shutil.copyfile(work_dir / "metadata.sqlite", destination / "metadata.sqlite")
     shard_src = work_dir / "shards"
     shard_dst = destination / "shards"
     if shard_dst.exists():
         shutil.rmtree(shard_dst)
     if shard_src.is_dir():
-        shutil.copytree(shard_src, shard_dst)
-    shutil.copyfile(work_dir / "metadata.sqlite", destination / "metadata.sqlite")
+        _copy_tree_contents(shard_src, shard_dst)
+    ready.write_text(
+        json.dumps({"completed_at": datetime.now(timezone.utc).isoformat()}) + "\n"
+    )
     print(f"Saved embed checkpoint to {destination}", flush=True)
     return destination
 
@@ -862,6 +880,8 @@ def save_embed_checkpoint(work_dir: Path) -> Path:
 def restore_embed_checkpoint(work_dir: Path) -> bool:
     """Restore a previous embed checkpoint into the local work dir if present."""
     source = checkpoint_dir()
+    if not (source / "CHECKPOINT_READY.json").is_file():
+        return False
     db_path = source / "metadata.sqlite"
     shard_src = source / "shards"
     if not db_path.is_file() or not shard_src.is_dir():
@@ -871,7 +891,7 @@ def restore_embed_checkpoint(work_dir: Path) -> bool:
     shard_dst = work_dir / "shards"
     if shard_dst.exists():
         shutil.rmtree(shard_dst)
-    shutil.copytree(shard_src, shard_dst)
+    _copy_tree_contents(shard_src, shard_dst)
     print(f"Restored embed checkpoint from {source}", flush=True)
     return True
 
@@ -1335,9 +1355,12 @@ def main() -> None:
         }
 
         if use_postgres:
-            # Persist shards+sqlite to the bucket mount before publish so a
-            # failed DB write can resume without re-embedding.
-            save_embed_checkpoint(WORK_DIR)
+            # Checkpointing is best-effort. Bucket mounts may reject chmod/utime
+            # semantics, and a checkpoint failure must not block DB publishing.
+            try:
+                save_embed_checkpoint(WORK_DIR)
+            except Exception as exc:
+                print(f"Embed checkpoint skipped: {exc}", flush=True)
             print("Publishing embeddings to Postgres…", flush=True)
             summary = publish_postgres(
                 connection,
