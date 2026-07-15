@@ -71,7 +71,11 @@ class FakeSession:
         self.calls = []
 
     def post(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        self.calls.append(("POST", url, kwargs))
+        return next(self.responses)
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
         return next(self.responses)
 
 
@@ -164,9 +168,10 @@ class SemanticScholarEnrichmentTests(unittest.TestCase):
             request_delay=0,
         )
 
-        call = session.calls[0][1]
-        self.assertEqual(call["headers"], {"x-api-key": "secret"})
-        self.assertEqual(call["json"], {"ids": ["ARXIV:2001.01072"]})
+        call = session.calls[0]
+        self.assertEqual(call[0], "POST")
+        self.assertEqual(call[2]["headers"], {"x-api-key": "secret"})
+        self.assertEqual(call[2]["json"], {"ids": ["ARXIV:2001.01072"]})
         self.assertEqual(candidates[0]["title"], "Authoritative arXiv title")
         self.assertEqual(candidates[0]["paperId"], "s2-paper")
         self.assertEqual(candidates[0]["citationCount"], 42)
@@ -233,6 +238,52 @@ class SemanticScholarEnrichmentTests(unittest.TestCase):
             self.assertEqual(second_session.calls, [])
             self.assertEqual(second[0]["semantic_scholar"]["status"], "not_found")
             connection.close()
+
+
+class SemanticScholarRecommendTests(unittest.TestCase):
+    def test_recommendations_keep_arxiv_papers_and_skip_duplicates(self):
+        from search_candidates import recommend_semantic_scholar
+
+        payload = {
+            "recommendedPapers": [
+                {
+                    "paperId": "s2-a",
+                    "title": "Related A",
+                    "abstract": "About scarce labels.",
+                    "externalIds": {"ArXiv": "2301.11111"},
+                },
+                {
+                    "paperId": "s2-b",
+                    "title": "Journal only",
+                    "abstract": "No arxiv id.",
+                    "externalIds": {"DOI": "10.1/x"},
+                },
+                {
+                    "paperId": "s2-c",
+                    "title": "Already seen",
+                    "abstract": "Dup.",
+                    "externalIds": {"ArXiv": "2001.01072"},
+                },
+            ]
+        }
+        session = FakeSession([FakeResponse(payload=payload)])
+        seeds = [{"arxiv_id": "2001.01072", "title": "Seed"}]
+
+        recs = recommend_semantic_scholar(
+            seeds,
+            api_key="secret",
+            session=session,
+            limit_per_seed=5,
+            request_delay=0,
+            exclude_ids={"2001.01072"},
+        )
+
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["arxiv_id"], "2301.11111")
+        self.assertEqual(recs[0]["retrieval_source"], "semantic_scholar_recommend")
+        self.assertEqual(recs[0]["recommended_from"], "2001.01072")
+        self.assertEqual(session.calls[0][0], "GET")
+        self.assertIn("ARXIV:2001.01072", session.calls[0][1])
 
 
 if __name__ == "__main__":

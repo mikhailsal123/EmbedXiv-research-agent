@@ -1,8 +1,8 @@
-"""Map extraction JSON to SPECTER2 queries, FAISS-search arXiv, optionally enrich via S2.
+"""Map extraction JSON to SPECTER2 queries, FAISS-search arXiv, S2 recommendations.
 
 Loads the latest corpus generation from Nebius Object Storage (published by
-datagen.embed_corpus), encodes queries with SPECTER2, searches FAISS, and
-optionally enriches hits via Semantic Scholar.
+datagen.embed_corpus), encodes queries with SPECTER2, searches FAISS, and can
+expand kept papers via Semantic Scholar graph recommendations.
 """
 
 from __future__ import annotations
@@ -25,6 +25,11 @@ import numpy as np
 import sys
 import traceback
 import re
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover
+    _tqdm = None
 
 # --- Corpus loader (published Object Storage artifacts) ---
 
@@ -352,6 +357,9 @@ from extract_claims import ExtractionResult, ResearchProblem, load_local_env
 
 
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
+S2_RECOMMEND_URL = (
+    "https://api.semanticscholar.org/recommendations/v1/papers/forpaper/{paper_id}"
+)
 S2_FIELDS = ",".join(
     (
         "paperId",
@@ -373,6 +381,10 @@ S2_FIELDS = ",".join(
 )
 TOP_K_PER_QUERY = 20
 DEFAULT_REQUEST_DELAY = 1.1
+DEFAULT_S2_RECOMMEND_LIMIT = 5
+S2_RECOMMEND_FIELDS = (
+    "paperId,title,abstract,url,year,citationCount,externalIds"
+)
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 SEARCH_ARTIFACTS = ("manifest.json", "index.faiss", "metadata.sqlite")
 
@@ -431,7 +443,25 @@ def download_generation(
     root.mkdir(parents=True, exist_ok=True)
     base = f"{prefix}/generations/{generation}"
     for name in SEARCH_ARTIFACTS:
-        http.download_file(bucket, f"{base}/{name}", str(root / name))
+        key = f"{base}/{name}"
+        path = str(root / name)
+        if _tqdm is None:
+            http.download_file(bucket, key, path)
+            continue
+        size = int(http.head_object(Bucket=bucket, Key=key)["ContentLength"])
+        with _tqdm(
+            total=size,
+            desc=f"Download {name}",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            file=sys.stdout,
+            mininterval=0.5,
+            dynamic_ncols=True,
+        ) as bar:
+            http.download_file(
+                bucket, key, path, Callback=lambda n: bar.update(n)
+            )
     return root
 
 
@@ -791,6 +821,142 @@ def enrich_semantic_scholar(
         if request_delay > 0 and start + batch_size < len(uncached):
             time.sleep(request_delay)
     return candidates
+
+
+def _arxiv_id_from_s2_paper(paper: dict) -> str | None:
+    external = paper.get("externalIds") or {}
+    raw = external.get("ArXiv") or external.get("arXiv") or external.get("ARXIV")
+    if not raw:
+        return None
+    return canonical_arxiv_id(str(raw))
+
+
+def _recommendation_candidate(paper: dict, *, seed_arxiv_id: str) -> dict | None:
+    arxiv_id = _arxiv_id_from_s2_paper(paper)
+    if not arxiv_id:
+        return None
+    title = (paper.get("title") or "").strip()
+    abstract = (paper.get("abstract") or "").strip()
+    if not title and not abstract:
+        return None
+    return {
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "abstract": abstract,
+        "url": paper.get("url") or f"https://arxiv.org/abs/{arxiv_id}",
+        "year": paper.get("year"),
+        "citationCount": paper.get("citationCount"),
+        "paperId": paper.get("paperId"),
+        "best_distance": 1e9,
+        "best_rank": 10_000,
+        "retrieval_source": "semantic_scholar_recommend",
+        "recommended_from": seed_arxiv_id,
+        "matched_queries": [
+            {
+                "level": "recommendation",
+                "query_type": "s2_graph",
+                "query": f"s2-recommend:{seed_arxiv_id}",
+                "source_text": f"Semantic Scholar recommendation from {seed_arxiv_id}",
+                "problem_index": 0,
+                "claim_index": None,
+                "detail_index": None,
+            }
+        ],
+    }
+
+
+def recommend_semantic_scholar(
+    seeds: list[dict],
+    *,
+    api_key: str | None = None,
+    session: requests.Session | None = None,
+    limit_per_seed: int = DEFAULT_S2_RECOMMEND_LIMIT,
+    from_pool: str = "all-cs",
+    request_delay: float = DEFAULT_REQUEST_DELAY,
+    max_retries: int = 3,
+    exclude_ids: set[str] | None = None,
+) -> list[dict]:
+    """Fetch a small S2 recommendation neighborhood for each kept seed paper.
+
+    Only recommendations with an arXiv id are returned (so the full-text judge
+    can fetch PDFs). Duplicates and `exclude_ids` are skipped.
+    """
+    if limit_per_seed < 1:
+        raise ValueError("limit_per_seed must be >= 1")
+    resolved_key = api_key if api_key is not None else os.getenv("S2_API_KEY")
+    if not resolved_key:
+        return []
+
+    http = session or requests.Session()
+    headers = {"x-api-key": resolved_key}
+    seen = set(exclude_ids or ())
+    for seed in seeds:
+        seed_id = canonical_arxiv_id(str(seed.get("arxiv_id", "")))
+        if seed_id:
+            seen.add(seed_id)
+
+    recommendations: list[dict] = []
+    usable_seeds = [
+        seed
+        for seed in seeds
+        if canonical_arxiv_id(str(seed.get("arxiv_id", "")))
+    ]
+    seed_iter = usable_seeds
+    if _tqdm is not None:
+        seed_iter = _tqdm(
+            usable_seeds,
+            desc="S2 recommend",
+            unit="seed",
+            file=sys.stdout,
+            mininterval=0.5,
+            dynamic_ncols=True,
+        )
+    for index, seed in enumerate(seed_iter):
+        seed_id = canonical_arxiv_id(str(seed["arxiv_id"]))
+        paper_id = f"ARXIV:{seed_id}"
+        url = S2_RECOMMEND_URL.format(paper_id=paper_id)
+        payload = None
+        for attempt in range(max_retries + 1):
+            response = http.get(
+                url,
+                params={
+                    "limit": limit_per_seed,
+                    "from": from_pool,
+                    "fields": S2_RECOMMEND_FIELDS,
+                },
+                headers=headers,
+                timeout=60,
+            )
+            if response.status_code not in RETRYABLE_STATUSES:
+                if response.status_code >= 400:
+                    break
+                payload = response.json()
+                break
+            if attempt == max_retries:
+                break
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else 2**attempt
+            except ValueError:
+                delay = 2**attempt
+            time.sleep(min(max(delay + random.uniform(0, 0.25), 0), 30))
+
+        if not isinstance(payload, dict):
+            continue
+        for paper in payload.get("recommendedPapers") or []:
+            if not isinstance(paper, dict):
+                continue
+            candidate = _recommendation_candidate(paper, seed_arxiv_id=seed_id)
+            if candidate is None:
+                continue
+            if candidate["arxiv_id"] in seen:
+                continue
+            seen.add(candidate["arxiv_id"])
+            recommendations.append(candidate)
+
+        if request_delay > 0 and index + 1 < len(usable_seeds):
+            time.sleep(request_delay)
+    return recommendations
 
 
 def main() -> None:

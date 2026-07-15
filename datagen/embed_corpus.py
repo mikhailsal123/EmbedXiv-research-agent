@@ -15,12 +15,18 @@ import os
 import random
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - dependency should be installed
+    tqdm = None  # type: ignore[assignment]
 
 
 DIMENSION = 768
@@ -354,75 +360,122 @@ def embed_pending(
 
     embedded = 0
     next_shard = _next_shard_number(shard_dir)
-    for shard_start in range(0, len(rows), shard_size):
-        shard_rows = rows[shard_start : shard_start + shard_size]
-        vectors = []
-        try:
-            for batch_start in range(0, len(shard_rows), batch_size):
-                batch_rows = shard_rows[batch_start : batch_start + batch_size]
-                texts = [
-                    document_text(row["title"], row["abstract"])
-                    for row in batch_rows
-                ]
-                vectors.append(encoder.encode_documents(texts, batch_size=batch_size))
-            matrix = np.ascontiguousarray(
-                np.concatenate(vectors), dtype=np.float32
+    total = len(rows)
+    print(
+        f"Embedding {total:,} pending papers "
+        f"(batch_size={batch_size}, shard_size={shard_size})",
+        flush=True,
+    )
+    if total == 0:
+        return 0
+
+    # Update only after a shard is fully encoded + persisted so failures cannot
+    # advance the bar past work that will be retried.
+    if tqdm is None:
+        progress = None
+        print(
+            "tqdm is not installed; progress bar disabled "
+            "(pip install tqdm or rebuild the Job image)",
+            flush=True,
+        )
+    else:
+        progress = tqdm(
+            total=total,
+            unit="paper",
+            desc="SPECTER2 embed",
+            file=sys.stdout,
+            dynamic_ncols=True,
+            mininterval=5.0,
+            ascii=True,
+            leave=True,
+        )
+    try:
+        for shard_start in range(0, len(rows), shard_size):
+            shard_rows = rows[shard_start : shard_start + shard_size]
+            vectors = []
+            try:
+                for batch_start in range(0, len(shard_rows), batch_size):
+                    batch_rows = shard_rows[batch_start : batch_start + batch_size]
+                    texts = [
+                        document_text(row["title"], row["abstract"])
+                        for row in batch_rows
+                    ]
+                    vectors.append(
+                        encoder.encode_documents(texts, batch_size=batch_size)
+                    )
+                matrix = np.ascontiguousarray(
+                    np.concatenate(vectors), dtype=np.float32
+                )
+            except Exception as exc:
+                with connection:
+                    for row in shard_rows:
+                        connection.execute(
+                            """
+                            INSERT INTO embedding_jobs (
+                                vector_id, content_hash, model_fingerprint, status,
+                                attempts, error
+                            ) VALUES (?, ?, ?, 'failed', 1, ?)
+                            ON CONFLICT(vector_id) DO UPDATE SET
+                                status='failed', attempts=attempts+1,
+                                error=excluded.error,
+                                updated_at=CURRENT_TIMESTAMP
+                            """,
+                            (
+                                row["vector_id"],
+                                row["content_hash"],
+                                encoder.fingerprint,
+                                str(exc),
+                            ),
+                        )
+                raise
+
+            shard_name = f"embeddings-{next_shard:06d}.npy"
+            ids_name = f"vector-ids-{next_shard:06d}.npy"
+            _atomic_save_array(shard_dir / shard_name, matrix)
+            _atomic_save_array(
+                shard_dir / ids_name,
+                np.asarray(
+                    [row["vector_id"] for row in shard_rows], dtype=np.int64
+                ),
             )
-        except Exception as exc:
             with connection:
-                for row in shard_rows:
+                for offset, row in enumerate(shard_rows):
                     connection.execute(
                         """
                         INSERT INTO embedding_jobs (
                             vector_id, content_hash, model_fingerprint, status,
-                            attempts, error
-                        ) VALUES (?, ?, ?, 'failed', 1, ?)
+                            attempts, error, shard_name, row_offset
+                        ) VALUES (?, ?, ?, 'done', 1, NULL, ?, ?)
                         ON CONFLICT(vector_id) DO UPDATE SET
-                            status='failed', attempts=attempts+1, error=excluded.error,
+                            content_hash=excluded.content_hash,
+                            model_fingerprint=excluded.model_fingerprint,
+                            status='done', attempts=attempts+1, error=NULL,
+                            shard_name=excluded.shard_name,
+                            row_offset=excluded.row_offset,
                             updated_at=CURRENT_TIMESTAMP
                         """,
                         (
                             row["vector_id"],
                             row["content_hash"],
                             encoder.fingerprint,
-                            str(exc),
+                            shard_name,
+                            offset,
                         ),
                     )
-            raise
-
-        shard_name = f"embeddings-{next_shard:06d}.npy"
-        ids_name = f"vector-ids-{next_shard:06d}.npy"
-        _atomic_save_array(shard_dir / shard_name, matrix)
-        _atomic_save_array(
-            shard_dir / ids_name,
-            np.asarray([row["vector_id"] for row in shard_rows], dtype=np.int64),
-        )
-        with connection:
-            for offset, row in enumerate(shard_rows):
-                connection.execute(
-                    """
-                    INSERT INTO embedding_jobs (
-                        vector_id, content_hash, model_fingerprint, status,
-                        attempts, error, shard_name, row_offset
-                    ) VALUES (?, ?, ?, 'done', 1, NULL, ?, ?)
-                    ON CONFLICT(vector_id) DO UPDATE SET
-                        content_hash=excluded.content_hash,
-                        model_fingerprint=excluded.model_fingerprint,
-                        status='done', attempts=attempts+1, error=NULL,
-                        shard_name=excluded.shard_name,
-                        row_offset=excluded.row_offset,
-                        updated_at=CURRENT_TIMESTAMP
-                    """,
-                    (
-                        row["vector_id"],
-                        row["content_hash"],
-                        encoder.fingerprint,
-                        shard_name,
-                        offset,
-                    ),
+            embedded += len(shard_rows)
+            next_shard += 1
+            if progress is not None:
+                progress.update(len(shard_rows))
+                progress.set_postfix(shard=next_shard - 1, refresh=False)
+            else:
+                print(
+                    f"Embedded {embedded:,}/{total:,} "
+                    f"({100.0 * embedded / total:.1f}%)",
+                    flush=True,
                 )
-        embedded += len(shard_rows)
-        next_shard += 1
+    finally:
+        if progress is not None:
+            progress.close()
     return embedded
 
 
@@ -655,6 +708,7 @@ def main() -> None:
         print(f"Loaded preload with {papers:,} papers", flush=True)
 
         encoder = Specter2Encoder(device="cuda")
+        print("SPECTER2 encoder ready", flush=True)
         embedded = embed_pending(
             connection,
             WORK_DIR,
@@ -663,11 +717,13 @@ def main() -> None:
             shard_size=int(os.getenv("SHARD_SIZE", "50000")),
         )
         print(f"Embedded {embedded:,} papers", flush=True)
+        print("Building FAISS index…", flush=True)
         build_faiss_index(
             connection,
             WORK_DIR,
             index_type=os.getenv("INDEX_TYPE", "ivf-sq8"),
         )
+        print("FAISS index written", flush=True)
     finally:
         connection.close()
 
