@@ -273,6 +273,8 @@ private paper or copyrighted PDF to the repo.
 
 The system uses two Nebius resources:
 
+![EmbedXiv architecture diagram](docs/demo/embedxiv_architecture.png)
+
 ### Qwen endpoint (`Dockerfile`)
 
 Always-on Ollama container with `qwen3:32b`. `extract_claims.py` calls it over
