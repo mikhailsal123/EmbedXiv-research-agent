@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import webbrowser
 from pathlib import Path
 
 from extract_claims import extract_claims, read_pdf_text
@@ -16,12 +17,17 @@ from search_candidates import (
     DEFAULT_REQUEST_DELAY,
     DEFAULT_S2_RECOMMEND_LIMIT,
     TOP_K_PER_QUERY,
+    canonical_arxiv_id,
+    detect_source_arxiv_id,
     open_index,
     recommend_semantic_scholar,
     search_all_candidates,
 )
 from suggestion_cards import write_suggestion_outputs
 
+
+DEFAULT_OUTPUT_DIR = Path("output")
+DEFAULT_OUTPUT_JSON = DEFAULT_OUTPUT_DIR / "full_run_results.json"
 
 def _print_judge_summary(label: str, candidates: list) -> None:
     screen_drop = 0
@@ -65,7 +71,7 @@ def main() -> None:
     )
     parser.add_argument("input", help="PDF or UTF-8 text file")
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"])
-    parser.add_argument("-o", "--output", default="research_results.json")
+    parser.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_JSON))
     parser.add_argument("--limit", type=int, default=TOP_K_PER_QUERY)
     parser.add_argument(
         "--no-judge",
@@ -92,12 +98,41 @@ def main() -> None:
     parser.add_argument(
         "--no-cards",
         action="store_true",
-        help="Skip writing suggestion card html/md/json outputs",
+        help="Skip writing suggestion card HTML/Markdown outputs",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the generated HTML in the default browser",
+    )
+    parser.add_argument(
+        "--source-arxiv-id",
+        action="append",
+        default=[],
+        help=(
+            "arXiv id of the input paper to exclude from results "
+            "(repeatable). Auto-detected from the paper header when omitted."
+        ),
     )
     args = parser.parse_args()
 
     input_path = Path(args.input)
     paper_text = read_input(input_path)
+    exclude_ids = {
+        canonical_arxiv_id(arxiv_id)
+        for arxiv_id in args.source_arxiv_id
+        if canonical_arxiv_id(arxiv_id)
+    }
+    detected = detect_source_arxiv_id(paper_text)
+    if detected:
+        exclude_ids.add(detected)
+    if exclude_ids:
+        print(
+            "Excluding source paper id(s): "
+            + ", ".join(sorted(exclude_ids)),
+            flush=True,
+        )
+
     print("Extracting claims…", flush=True)
     problems = extract_claims(paper_text)
     print(f"Extracted {len(problems)} problem(s).", flush=True)
@@ -108,6 +143,7 @@ def main() -> None:
             problems,
             index,
             limit=args.limit,
+            exclude_ids=exclude_ids or None,
             enrich_s2=False,
             request_delay=args.request_delay,
         )
@@ -130,7 +166,8 @@ def main() -> None:
                 recommendations = recommend_semantic_scholar(
                     seeds,
                     limit_per_seed=args.s2_recommend_limit,
-                    exclude_ids={c["arxiv_id"] for c in candidates},
+                    exclude_ids=(exclude_ids or set())
+                    | {c["arxiv_id"] for c in candidates},
                     request_delay=args.request_delay,
                 )
                 if recommendations:
@@ -154,8 +191,10 @@ def main() -> None:
         if (candidate.get("judgment") or {}).get("decision") == "keep"
     )
     output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output = {
         "source": str(input_path),
+        "source_arxiv_ids": sorted(exclude_ids),
         "problems": [problem.model_dump() for problem in problems],
         "candidates": candidates,
         "kept_count": kept if not args.no_judge else None,
@@ -175,6 +214,8 @@ def main() -> None:
                 problems=problems,
             )
             print(f"Suggestion cards → {written['html']}")
+            if not args.no_open:
+                webbrowser.open(written["html"].resolve().as_uri())
 
 
 if __name__ == "__main__":

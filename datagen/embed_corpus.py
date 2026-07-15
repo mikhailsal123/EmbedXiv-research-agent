@@ -521,6 +521,263 @@ def _vectors_for_rows(
     )
 
 
+HNSW_INDEX_NAME = "papers_embedding_hnsw"
+
+
+def database_url() -> str | None:
+    value = os.getenv("DATABASE_URL", "").strip()
+    return value or None
+
+
+def require_database_url() -> str:
+    url = database_url()
+    if not url:
+        raise RuntimeError("Set DATABASE_URL in the Job environment")
+    return url
+
+
+def connect_pg():
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install requirements.txt (psycopg) for Postgres publish"
+        ) from exc
+
+    return psycopg.connect(require_database_url(), row_factory=dict_row)
+
+
+def pg_vector_literal(vector: Sequence[float] | np.ndarray) -> str:
+    values = np.asarray(vector, dtype=np.float32).tolist()
+    return "[" + ",".join(f"{value:.8g}" for value in values) + "]"
+
+
+def ensure_pg_schema(connection, *, create_index: bool = False) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corpus_manifest (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS papers (
+                vector_id BIGINT PRIMARY KEY,
+                arxiv_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                abstract TEXT NOT NULL DEFAULT '',
+                categories TEXT NOT NULL DEFAULT '',
+                authors TEXT NOT NULL DEFAULT '',
+                license TEXT NOT NULL DEFAULT '',
+                datestamp TEXT NOT NULL DEFAULT '',
+                deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                content_hash TEXT NOT NULL,
+                model_fingerprint TEXT NOT NULL,
+                embedding vector({DIMENSION}) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS papers_arxiv_id_idx ON papers (arxiv_id)"
+        )
+        if create_index:
+            cursor.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {HNSW_INDEX_NAME}
+                ON papers USING hnsw (embedding vector_l2_ops)
+                WITH (m = 16, ef_construction = 64)
+                """
+            )
+    connection.commit()
+
+
+def write_pg_manifest(connection, manifest: dict) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO corpus_manifest (id, payload, updated_at)
+            VALUES (1, %s::jsonb, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            (json.dumps(manifest),),
+        )
+    connection.commit()
+
+
+def read_pg_manifest(connection) -> dict:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT payload FROM corpus_manifest WHERE id = 1")
+        row = cursor.fetchone()
+    if not row:
+        raise RuntimeError("Postgres corpus is missing corpus_manifest")
+    payload = row["payload"]
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return dict(payload)
+
+
+def _embedded_paper_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT
+            p.vector_id,
+            p.arxiv_id,
+            p.title,
+            p.abstract,
+            p.categories,
+            p.authors,
+            p.license,
+            p.datestamp,
+            p.deleted,
+            p.content_hash,
+            j.shard_name,
+            j.row_offset,
+            j.model_fingerprint
+        FROM papers p
+        JOIN embedding_jobs j ON p.vector_id = j.vector_id
+        WHERE p.deleted = 0
+          AND j.status = 'done'
+          AND p.content_hash = j.content_hash
+        ORDER BY p.vector_id
+        """
+    ).fetchall()
+    if not rows:
+        raise RuntimeError("No embedded papers are available to publish")
+    fingerprints = {row["model_fingerprint"] for row in rows}
+    if len(fingerprints) != 1:
+        raise RuntimeError("Embedded papers use multiple model fingerprints")
+    return rows
+
+
+def rebuild_pg_hnsw_index(connection) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(f"DROP INDEX IF EXISTS {HNSW_INDEX_NAME}")
+        cursor.execute(
+            f"""
+            CREATE INDEX {HNSW_INDEX_NAME}
+            ON papers USING hnsw (embedding vector_l2_ops)
+            WITH (m = 16, ef_construction = 64)
+            """
+        )
+    connection.commit()
+
+
+def publish_postgres(
+    sqlite_connection: sqlite3.Connection,
+    index_dir: Path,
+    manifest: dict,
+    *,
+    batch_size: int = 5_000,
+) -> dict:
+    """Upsert embedded papers from workspace shards into Managed Postgres."""
+    rows = _embedded_paper_rows(sqlite_connection)
+    model_fingerprint = rows[0]["model_fingerprint"]
+    pg = connect_pg()
+    try:
+        ensure_pg_schema(pg, create_index=False)
+        published = 0
+        sql = """
+            INSERT INTO papers (
+                vector_id, arxiv_id, title, abstract, categories, authors,
+                license, datestamp, deleted, content_hash, model_fingerprint,
+                embedding
+            ) VALUES (
+                %(vector_id)s, %(arxiv_id)s, %(title)s, %(abstract)s,
+                %(categories)s, %(authors)s, %(license)s, %(datestamp)s,
+                %(deleted)s, %(content_hash)s, %(model_fingerprint)s,
+                %(embedding)s::vector
+            )
+            ON CONFLICT (vector_id) DO UPDATE SET
+                arxiv_id = EXCLUDED.arxiv_id,
+                title = EXCLUDED.title,
+                abstract = EXCLUDED.abstract,
+                categories = EXCLUDED.categories,
+                authors = EXCLUDED.authors,
+                license = EXCLUDED.license,
+                datestamp = EXCLUDED.datestamp,
+                deleted = EXCLUDED.deleted,
+                content_hash = EXCLUDED.content_hash,
+                model_fingerprint = EXCLUDED.model_fingerprint,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW()
+        """
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            vectors, _ = _vectors_for_rows(chunk, index_dir)
+            payload = []
+            for row, vector in zip(chunk, vectors):
+                payload.append(
+                    {
+                        "vector_id": int(row["vector_id"]),
+                        "arxiv_id": row["arxiv_id"],
+                        "title": row["title"],
+                        "abstract": row["abstract"],
+                        "categories": row["categories"],
+                        "authors": row["authors"],
+                        "license": row["license"],
+                        "datestamp": row["datestamp"],
+                        "deleted": bool(row["deleted"]),
+                        "content_hash": row["content_hash"],
+                        "model_fingerprint": model_fingerprint,
+                        "embedding": pg_vector_literal(vector),
+                    }
+                )
+            with pg.cursor() as cursor:
+                cursor.executemany(sql, payload)
+            pg.commit()
+            published += len(payload)
+            print(
+                f"Published {published:,}/{len(rows):,} papers to Postgres",
+                flush=True,
+            )
+
+        summary = {
+            **manifest,
+            "paper_count": published,
+            "model_fingerprint": model_fingerprint,
+            "storage": "postgres_pgvector",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_pg_manifest(pg, summary)
+        print("Building HNSW index in Postgres…", flush=True)
+        rebuild_pg_hnsw_index(pg)
+        return summary
+    finally:
+        pg.close()
+
+
+def verify_postgres(manifest: dict) -> dict:
+    pg = connect_pg()
+    try:
+        with pg.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM papers WHERE NOT deleted")
+            papers = cursor.fetchone()["count"]
+            cursor.execute(
+                "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+                (HNSW_INDEX_NAME,),
+            )
+            has_index = cursor.fetchone() is not None
+        expected = int(manifest["paper_count"])
+        if papers != expected:
+            raise RuntimeError(
+                f"Postgres paper count mismatch: db={papers}, manifest={expected}"
+            )
+        if not has_index:
+            raise RuntimeError("Postgres corpus is missing the HNSW index")
+        return {**manifest, "verified_paper_count": papers}
+    finally:
+        pg.close()
+
+
 def build_faiss_index(
     connection: sqlite3.Connection,
     index_dir: Path,
@@ -682,9 +939,11 @@ def publish(index_dir: Path, summary: dict) -> Path:
 
 
 def main() -> None:
-    """Read preloaded metadata from the bucket mount, embed on GPU, publish FAISS."""
+    """Read preloaded metadata from the bucket mount, embed on GPU, publish."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+    use_postgres = bool(database_url())
 
     preload_db = OUTPUT_DIR / "metadata.sqlite"
     ready = OUTPUT_DIR / "PRELOAD_READY.json"
@@ -717,6 +976,42 @@ def main() -> None:
             shard_size=int(os.getenv("SHARD_SIZE", "50000")),
         )
         print(f"Embedded {embedded:,} papers", flush=True)
+
+        embedded_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM papers p
+            JOIN embedding_jobs j ON p.vector_id = j.vector_id
+            WHERE p.deleted = 0
+              AND j.status = 'done'
+              AND p.content_hash = j.content_hash
+            """
+        ).fetchone()[0]
+        manifest = {
+            "dimension": DIMENSION,
+            "metric": "l2",
+            "index_type": "hnsw" if use_postgres else os.getenv("INDEX_TYPE", "ivf-sq8"),
+            "paper_count": embedded_count,
+            "model_fingerprint": encoder.fingerprint,
+            "document_adapter": DOCUMENT_ADAPTER,
+            "query_adapter": QUERY_ADAPTER,
+        }
+
+        if use_postgres:
+            print("Publishing embeddings to Postgres…", flush=True)
+            summary = publish_postgres(
+                connection,
+                WORK_DIR,
+                manifest,
+                batch_size=int(os.getenv("PG_BATCH_SIZE", "5000")),
+            )
+            summary = verify_postgres(summary)
+            print(
+                f"Published verified Postgres corpus ({summary['paper_count']:,} papers)",
+                flush=True,
+            )
+            return
+
         print("Building FAISS index…", flush=True)
         build_faiss_index(
             connection,

@@ -684,22 +684,14 @@ def write_suggestion_outputs(
         candidates, problems=problems, kept_only=kept_only
     )
     groups = group_cards(cards, problems=problems)
-    payload = {
-        "source": source,
-        "card_count": len(cards),
-        "cards": cards,
-        "groups": groups,
-    }
-    cards_json = output_json.with_name(output_json.stem + "_cards.json")
     cards_md = output_json.with_name(output_json.stem + "_cards.md")
     cards_html = output_json.with_name(output_json.stem + "_cards.html")
-    cards_json.write_text(json.dumps(payload, indent=2) + "\n")
+    output_json.parent.mkdir(parents=True, exist_ok=True)
     cards_md.write_text(render_markdown(cards, source=source, problems=problems))
     cards_html.write_text(render_html(cards, source=source, problems=problems))
     return {
         "cards": cards,
         "groups": groups,
-        "json": cards_json,
         "markdown": cards_md,
         "html": cards_html,
     }
@@ -714,7 +706,7 @@ def main() -> None:
         "-o",
         "--output",
         type=Path,
-        help="Base path; writes *_cards.json/md/html beside it",
+        help="Base path; writes *_cards.md/html beside it",
     )
     parser.add_argument(
         "--include-dropped",
@@ -733,7 +725,7 @@ def main() -> None:
     )
     print(
         f"Wrote {len(written['cards'])} cards → "
-        f"{written['html']} (+ json/md)"
+        f"{written['html']} (+ md)"
     )
 
 

@@ -13,6 +13,7 @@ from datagen.embed_corpus import (
     DIMENSION,
     build_faiss_index,
     embed_pending,
+    pg_vector_literal,
 )
 from datagen.preload_metadata import (
     ArxivPaper,
@@ -43,6 +44,12 @@ class FakeEncoder:
 
     def encode_queries(self, texts, batch_size):
         return self._vectors(texts)
+
+
+class PgVectorLiteralTests(unittest.TestCase):
+    def test_pg_vector_literal_formats_floats(self):
+        vector = np.array([0.1, 1.0, -2.5], dtype=np.float32)
+        self.assertEqual(pg_vector_literal(vector), "[0.1,1,-2.5]")
 
 
 class MetadataTests(unittest.TestCase):

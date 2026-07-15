@@ -159,16 +159,16 @@ class SuggestionCardTests(unittest.TestCase):
 
     def test_writes_sidecar_files(self):
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory) / "results.json"
+            base = Path(directory) / "full_run" / "full_run_results.json"
             written = write_suggestion_outputs(
                 self.candidates,
                 base,
                 source="demo.pdf",
                 problems=self.problems,
             )
-            self.assertTrue(written["json"].is_file())
             self.assertTrue(written["markdown"].is_file())
             self.assertTrue(written["html"].is_file())
+            self.assertEqual(written["markdown"].name, "full_run_results_cards.md")
             self.assertEqual(len(written["cards"]), 2)
             self.assertEqual(len(written["groups"]), 3)
 

@@ -13,7 +13,9 @@ from extract_claims import (
 from search_candidates import (
     build_queries,
     connect_database,
+    detect_source_arxiv_id,
     enrich_semantic_scholar,
+    open_index,
     search_candidates,
     specter2_query_text,
 )
@@ -142,6 +144,50 @@ class QueryGenerationTests(unittest.TestCase):
         self.assertEqual(candidates[0]["arxiv_id"], "2001.01072")
         self.assertEqual(len(candidates[0]["matched_queries"]), 5)
         self.assertEqual(len(index.queries), 5)
+
+    def test_excludes_source_arxiv_id_from_faiss_hits(self):
+        hits = [
+            {
+                "arxiv_id": "1807.06521",
+                "title": "CBAM itself",
+                "abstract": "Self",
+                "distance": 0.01,
+                "rank": 1,
+            },
+            {
+                "arxiv_id": "1807.06514",
+                "title": "BAM",
+                "abstract": "Sibling",
+                "distance": 0.2,
+                "rank": 2,
+            },
+        ]
+        index = FakeVectorIndex([[hits[0], hits[1]] for _ in range(5)])
+
+        candidates = search_candidates(
+            sample_problem(),
+            index,
+            exclude_ids={"1807.06521"},
+        )
+
+        self.assertEqual([c["arxiv_id"] for c in candidates], ["1807.06514"])
+
+    def test_detect_source_arxiv_id_from_header_not_bibliography(self):
+        text = (
+            "arXiv:1807.06521v1 [cs.CV] 18 Jul 2018\n"
+            "CBAM: Convolutional Block Attention Module\n\n"
+            + ("body " * 500)
+            + "\nReferences\n[1] arXiv:1709.01507 Squeeze-and-Excitation\n"
+        )
+        self.assertEqual(detect_source_arxiv_id(text), "1807.06521")
+
+    @patch.dict("os.environ", {"DATABASE_URL": "postgresql://example"}, clear=False)
+    @patch("search_candidates.PgvectorIndex")
+    def test_open_index_uses_postgres_when_database_url_set(self, mock_index):
+        mock_index.return_value.__enter__.return_value = object()
+        with open_index():
+            pass
+        mock_index.assert_called_once()
 
 
 class SemanticScholarEnrichmentTests(unittest.TestCase):

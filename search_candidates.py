@@ -1,8 +1,7 @@
-"""Map extraction JSON to SPECTER2 queries, FAISS-search arXiv, S2 recommendations.
+"""Map extraction JSON to SPECTER2 queries, vector search, S2 recommendations.
 
-Loads the latest corpus generation from Nebius Object Storage (published by
-datagen.embed_corpus), encodes queries with SPECTER2, searches FAISS, and can
-expand kept papers via Semantic Scholar graph recommendations.
+When DATABASE_URL is set, search uses Managed Postgres + pgvector. Otherwise
+the latest FAISS generation is downloaded from Nebius Object Storage.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator, Literal, Protocol, Sequence
+from typing import Any, Iterator, Literal, Protocol, Sequence
 
 import requests
 
@@ -56,6 +55,21 @@ def canonical_arxiv_id(value: str) -> str:
             value = value[len(prefix) :]
             break
     return re.sub(r"v\d+$", "", value)
+
+
+# Prefer header/watermark mentions over bibliography citations.
+_ARXIV_ID_RE = re.compile(
+    r"(?i)(?:arxiv\.org/(?:abs|pdf)/|arxiv[:\s]+)([0-9]{4}\.[0-9]{4,5}|[a-z\-]+/\d{7})"
+)
+
+
+def detect_source_arxiv_id(paper_text: str, *, head_chars: int = 4000) -> str | None:
+    """Best-effort source arXiv id from the paper header (not the bibliography)."""
+    head = (paper_text or "")[:head_chars]
+    match = _ARXIV_ID_RE.search(head)
+    if not match:
+        return None
+    return canonical_arxiv_id(match.group(1)) or None
 
 def connect_database(index_dir: Path) -> sqlite3.Connection:
     """Open an already-published corpus SQLite database."""
@@ -353,6 +367,96 @@ class ArxivIndex:
             output.append(hits)
         return output
 
+
+class PgvectorIndex:
+    """Search the corpus in Managed Postgres via pgvector."""
+
+    def __init__(
+        self,
+        *,
+        encoder: Encoder | None = None,
+        device: str | None = None,
+        query_batch_size: int = 32,
+        ef_search: int | None = None,
+    ) -> None:
+        from datagen.embed_corpus import connect_pg, pg_vector_literal, read_pg_manifest
+
+        self._pg_vector_literal = pg_vector_literal
+        self._owns_encoder = encoder is None
+        if encoder is not None:
+            self.encoder = encoder
+        elif sys.platform == "darwin":
+            self.encoder = Specter2QueryWorker(device=device)
+        else:
+            self.encoder = Specter2Encoder(device=device)
+        self.query_batch_size = query_batch_size
+        self.ef_search = ef_search
+        self._pg = connect_pg()
+        self.manifest = read_pg_manifest(self._pg)
+        if self.encoder.dimension != self.manifest["dimension"]:
+            raise ValueError("Query encoder and corpus dimensions differ")
+        if self.encoder.fingerprint != self.manifest["model_fingerprint"]:
+            raise ValueError("Query encoder and corpus model revisions differ")
+        self._s2_cache_dir = Path(tempfile.mkdtemp(prefix="embedxiv-s2-"))
+        self.connection = connect_database(self._s2_cache_dir)
+
+    def close(self) -> None:
+        self.connection.close()
+        self._pg.close()
+        if self._owns_encoder and hasattr(self.encoder, "close"):
+            self.encoder.close()
+
+    def __enter__(self) -> "PgvectorIndex":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def search(self, query_texts: Sequence[str], k: int = 20) -> list[list[dict]]:
+        if not query_texts:
+            return []
+        if k < 1:
+            raise ValueError("k must be positive")
+
+        vectors = self.encoder.encode_queries(
+            query_texts, batch_size=self.query_batch_size
+        )
+        if self.ef_search is not None:
+            with self._pg.cursor() as cursor:
+                cursor.execute("SET hnsw.ef_search = %s", (self.ef_search,))
+
+        output: list[list[dict]] = []
+        for vector in vectors:
+            literal = self._pg_vector_literal(vector)
+            with self._pg.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT vector_id, arxiv_id, title, abstract, categories,
+                           authors, license, datestamp,
+                           embedding <-> %s::vector AS distance
+                    FROM papers
+                    WHERE NOT deleted
+                    ORDER BY embedding <-> %s::vector
+                    LIMIT %s
+                    """,
+                    (literal, literal, k),
+                )
+                rows = cursor.fetchall()
+
+            hits = []
+            for rank, row in enumerate(rows, start=1):
+                hit = dict(row)
+                hit.update(
+                    {
+                        "distance": float(hit.pop("distance")),
+                        "rank": rank,
+                        "url": f"https://arxiv.org/abs/{hit['arxiv_id']}",
+                    }
+                )
+                hits.append(hit)
+            output.append(hits)
+        return output
+
 from extract_claims import ExtractionResult, ResearchProblem, load_local_env
 
 
@@ -468,8 +572,14 @@ def download_generation(
 @contextmanager
 def open_index(
     *, device: str | None = None, query_batch_size: int = 32
-) -> Iterator[ArxivIndex]:
-    """Fetch the latest corpus from Object Storage and open it for search."""
+) -> Iterator[ArxivIndex | PgvectorIndex]:
+    """Open the corpus for search (Postgres when DATABASE_URL is set)."""
+    load_local_env()
+    if os.getenv("DATABASE_URL", "").strip():
+        with PgvectorIndex(device=device, query_batch_size=query_batch_size) as index:
+            yield index
+        return
+
     with tempfile.TemporaryDirectory(prefix="embedxiv-index-") as temporary:
         index_dir = download_generation(Path(temporary))
         with ArxivIndex(
@@ -481,7 +591,7 @@ def open_index(
 
 
 class VectorIndex(Protocol):
-    connection: sqlite3.Connection
+    connection: sqlite3.Connection | Any
 
     def search(self, query_texts: Sequence[str], k: int) -> list[list[dict]]:
         ...
@@ -584,6 +694,7 @@ def search_candidates(
     *,
     problem_index: int = 0,
     limit: int = TOP_K_PER_QUERY,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict]:
     """Vector-search every hierarchy query and preserve match provenance."""
     queries = build_queries(problem, problem_index)
@@ -591,12 +702,17 @@ def search_candidates(
     if len(result_sets) != len(queries):
         raise ValueError("Vector index returned a different number of result sets")
 
+    blocked = {
+        canonical_arxiv_id(arxiv_id)
+        for arxiv_id in (exclude_ids or set())
+        if canonical_arxiv_id(arxiv_id)
+    }
     candidates_by_id: dict[str, dict] = {}
     for search_query, results in zip(queries, result_sets):
         query_metadata = asdict(search_query)
         for result in results:
             arxiv_id = canonical_arxiv_id(result.get("arxiv_id", ""))
-            if not arxiv_id:
+            if not arxiv_id or arxiv_id in blocked:
                 continue
 
             if arxiv_id not in candidates_by_id:
@@ -633,6 +749,7 @@ def search_all_candidates(
     index: VectorIndex,
     *,
     limit: int = TOP_K_PER_QUERY,
+    exclude_ids: set[str] | None = None,
     enrich_s2: bool = True,
     api_key: str | None = None,
     session: requests.Session | None = None,
@@ -646,6 +763,7 @@ def search_all_candidates(
             index,
             problem_index=problem_index,
             limit=limit,
+            exclude_ids=exclude_ids,
         ):
             arxiv_id = candidate["arxiv_id"]
             if arxiv_id not in candidates_by_id:
