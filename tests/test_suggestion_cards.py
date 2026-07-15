@@ -148,6 +148,7 @@ class SuggestionCardTests(unittest.TestCase):
         self.assertIn("box-claim", page)
         self.assertIn("box-implementation", page)
         self.assertIn("card-date", page)
+        self.assertIn("literature-aware suggestion engine", page)
         self.assertIn("2023-01-01", page)
         self.assertNotIn("Unmatched claim that should be omitted.", page)
         # Sibling sections, not claim nested inside problem markup

@@ -12,6 +12,8 @@ papers/
 .cache/
 .pytest_cache/
 output/
+eval/runs/*
+!eval/runs/cbam_rubric.csv
 *.faiss
 *.sqlite
 *.sqlite-shm

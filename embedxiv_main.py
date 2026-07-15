@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import webbrowser
 from pathlib import Path
 
@@ -181,7 +182,18 @@ def main() -> None:
             "(repeatable). Auto-detected from the paper header when omitted."
         ),
     )
+    parser.add_argument(
+        "--no-per-node-cap",
+        action="store_true",
+        help="Skip the per-node kept-suggestion cap (ablation / eval runs)",
+    )
+    parser.add_argument(
+        "--run-label",
+        default="default",
+        help="Label stored in results JSON for eval comparisons (default: default)",
+    )
     args = parser.parse_args()
+    run_started = time.monotonic()
 
     input_path = Path(args.input)
     paper_text = read_input(input_path)
@@ -292,9 +304,12 @@ def main() -> None:
                 else:
                     print("No S2 recommendations to judge.", flush=True)
 
-            print("Capping kept suggestions per source node…", flush=True)
-            candidates = cap_kept_candidates_per_node(problems, candidates)
-            _print_judge_summary("After per-node cap", candidates)
+            if args.no_per_node_cap:
+                print("Skipping per-node cap (--no-per-node-cap).", flush=True)
+            else:
+                print("Capping kept suggestions per source node…", flush=True)
+                candidates = cap_kept_candidates_per_node(problems, candidates)
+                _print_judge_summary("After per-node cap", candidates)
 
     kept = sum(
         1
@@ -303,6 +318,7 @@ def main() -> None:
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    elapsed_seconds = round(time.monotonic() - run_started, 1)
     output = {
         "source": str(input_path),
         "source_arxiv_ids": sorted(exclude_ids),
@@ -310,6 +326,13 @@ def main() -> None:
         "candidates": candidates,
         "search_refinement_trace": search_refinement_trace,
         "kept_count": kept if not args.no_judge else None,
+        "run": {
+            "label": args.run_label,
+            "elapsed_seconds": elapsed_seconds,
+            "search_refinement": not args.no_search_refinement,
+            "per_node_cap": not args.no_per_node_cap,
+            "semantic_scholar": not args.no_s2,
+        },
     }
     output_path.write_text(json.dumps(output, indent=2) + "\n")
     if args.no_judge:
@@ -318,6 +341,7 @@ def main() -> None:
         print(
             f"Saved {len(candidates)} candidates ({kept} kept) to {output_path}"
         )
+        print(f"Run time: {elapsed_seconds:.1f}s (label={args.run_label})", flush=True)
         if not args.no_cards:
             written = write_suggestion_outputs(
                 candidates,

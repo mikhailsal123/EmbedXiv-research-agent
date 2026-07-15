@@ -453,6 +453,17 @@ GPUs, Postgres size, and Object Storage size. The direct GPU Job estimate is:
 `GPU job cost = job hours x GPU count x selected GPU hourly price`, plus the
 endpoint, Postgres, and storage line items from the Nebius console.
 
+### Teardown after demo
+
+When the challenge demo is complete:
+
+1. Stop or delete the Qwen Serverless Endpoint so it is not billed while idle.
+2. Scale down or delete Managed Postgres if you no longer need the live index.
+3. Remove Object Storage preload artifacts if Postgres is your only backend.
+4. Rotate API keys that were used on a shared machine.
+
+See also [`eval/README.md`](eval/README.md) for the pilot eval workflow.
+
 ## Run the pipeline
 
 After the Qwen endpoint is live and the corpus Job has published the Postgres
@@ -489,6 +500,63 @@ Use `--no-open` to suppress that behavior. Override the destination with
 
 Add `--no-s2` to disable Semantic Scholar graph recommendations.
 Add `--no-search-refinement` to disable the bounded agentic substitute-search loop.
+Add `--no-per-node-cap` to skip the per-node kept-suggestion cap (ablation runs).
+Use `--run-label NAME` to tag results JSON for eval comparisons.
+
+## Pilot evaluation
+
+Pilot case study on CBAM (`1807.06521`). We report pipeline selectivity from
+the full run and human ratings on all 25 final suggestions (single-rater,
+1–5 scale).
+
+### Pipeline funnel (automatic)
+
+| Stage | Count |
+| --- | ---: |
+| Retrieved candidates | 192 |
+| Abstract screen → full-text review | 73 |
+| Full-text judge → accepted (pre-cap) | 58 |
+| Per-node cap → final suggestions | 25 |
+| Final suggestions from agentic refinement | 11 |
+| Source contamination | 0 |
+
+Reproduce:
+
+```bash
+python3 eval/summarize_run.py output/full_run_results.json
+```
+
+### Human quality ratings
+
+Every final suggestion was scored on **specific relevance**, **actionability**,
+and **non-redundancy** (1–5 scale, single rater). Raw scores with per-paper
+notes live in [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
+
+| Metric | CBAM pilot |
+| --- | ---: |
+| Rated suggestions (n) | 25 |
+| High-quality rate (relevance ≥ 4 and actionability ≥ 4) | 100% |
+| Mean specific relevance | 4.60 |
+| Mean actionability | 4.68 |
+| Mean non-redundancy | 4.48 |
+| Redundancy rate (non-redundancy ≤ 2) | 0% |
+
+Reproduce the aggregation:
+
+```bash
+python3 eval/aggregate_scores.py eval/runs/cbam_rubric.csv
+```
+
+> We evaluate final suggestions by human ratings on specific relevance,
+> actionability, and non-redundancy — not vector similarity alone.
+
+Full workflow (ablations, teardown): [`eval/README.md`](eval/README.md).
+
+Quick start on a new paper:
+
+```bash
+./eval/run_pilot.sh path/to/your_paper.pdf
+```
 
 Agentic search-refinement cost controls:
 

@@ -33,6 +33,14 @@ RELATION_ORDER = [
     "implementation_alternative",
 ]
 
+EMBEDXIV_INTRO = (
+    "EmbedXiv is a literature-aware suggestion engine for research drafts that "
+    "works by keeping you updated on novel contributions within your field. It checks "
+    "your draft against recent CS papers published on arXiv and points to "
+    "places where the work may need a stronger comparison, a clearer claim, or "
+    "a different technical choice."
+)
+
 LEVEL_LABELS = {
     "problem": "Problem",
     "claim": "Claim",
@@ -464,9 +472,9 @@ def render_markdown(
 ) -> str:
     lines: list[str] = ["# EmbedXiv suggestions", ""]
     if source:
-        lines.append(f"Source: `{source}`")
-        lines.append("")
-    lines.append(f"{len(cards)} kept paper(s).")
+        lines.append(f"{len(cards)} kept paper(s). Source: `{source}`")
+    else:
+        lines.append(f"{len(cards)} kept paper(s).")
     lines.append("")
     for box in group_cards(cards, problems=problems):
         lines.append(f"## {box.get('label') or 'Node'}")
@@ -536,11 +544,13 @@ def render_html(
 """.strip()
         )
 
-    source_line = (
-        f"<p class='source'>Source: <code>{html.escape(source)}</code></p>"
-        if source
-        else ""
-    )
+    if source:
+        lede = (
+            f"{len(cards)} kept paper(s). "
+            f"Source: <code>{html.escape(source)}</code>"
+        )
+    else:
+        lede = f"{len(cards)} kept paper(s)."
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -582,6 +592,18 @@ def render_html(
     .lede, .source {{
       color: var(--muted);
       font-size: 0.95rem;
+    }}
+    .intro {{
+      max-width: none;
+      width: 100%;
+      margin: 0.9rem 0 1.1rem;
+      padding: 0.85rem 1.1rem;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent);
+      color: var(--ink);
+      font-size: 1rem;
+      line-height: 1.6;
     }}
     .box {{
       margin-top: 1.25rem;
@@ -673,8 +695,8 @@ def render_html(
 <body>
   <main>
     <h1>EmbedXiv suggestions</h1>
-    <p class="lede">{len(cards)} kept paper(s).</p>
-    {source_line}
+    <p class="intro">{html.escape(EMBEDXIV_INTRO)}</p>
+    <p class="lede">{lede}</p>
     {" ".join(sections) if sections else "<p>No kept papers.</p>"}
   </main>
 </body>
