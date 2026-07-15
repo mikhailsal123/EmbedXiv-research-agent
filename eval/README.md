@@ -1,89 +1,73 @@
-# Pilot evaluation (3-hour workflow)
+# Eval scripts
 
-Generate evidence, score kept cards, and paste tables into your blog or README.
+Small scripts for turning a pipeline run into numbers you can put in the README
+or blog post.
 
-## Hour 1 — Generate evidence
+## What to run
 
-Run the full pipeline plus two ablations on the same paper:
+### 1. Funnel counts (from an existing results JSON)
+
+```bash
+python3 eval/summarize_run.py output/full_run_results.json
+```
+
+Gives retrieved → screened → kept → capped counts, plus whether the input paper
+leaked into results.
+
+### 2. Export cards for manual scoring
+
+```bash
+python3 eval/export_rubric.py output/full_run_results.json \
+  -o eval/runs/cbam_rubric.csv
+```
+
+Open the CSV. For each kept suggestion, fill in three scores (1–5):
+
+| Column | What you're asking |
+| --- | --- |
+| `specific_relevance_1_5` | Does this actually help the problem/claim/detail it's under? |
+| `actionability_1_5` | Would you cite it, compare against it, or try something from it? |
+| `non_redundancy_1_5` | Is it meaningfully different from the other cards in that section? |
+
+### 3. Aggregate scores
+
+```bash
+python3 eval/aggregate_scores.py eval/runs/cbam_rubric.csv
+```
+
+Outputs:
+
+- **High-quality rate** — both relevance and actionability ≥ 4
+- **Redundancy rate** — non-redundancy ≤ 2
+- Means for each column
+
+Blank template: `eval/rubric_template.csv`
+
+## Optional: full run + ablations
+
+If you want to compare with/without refinement or per-node cap:
 
 ```bash
 chmod +x eval/run_pilot.sh
-./eval/run_pilot.sh papers/CBAM_paper.pdf
+./eval/run_pilot.sh path/to/paper.pdf
 ```
 
-Or run variants manually:
-
-```bash
-mkdir -p eval/runs/manual
-python3 embedxiv_main.py papers/CBAM_paper.pdf --no-open \
-  --run-label full -o eval/runs/manual/full.json
-
-python3 embedxiv_main.py papers/CBAM_paper.pdf --no-open \
-  --run-label no_refinement --no-search-refinement \
-  -o eval/runs/manual/no_refinement.json
-
-python3 embedxiv_main.py papers/CBAM_paper.pdf --no-open \
-  --run-label no_cap --no-per-node-cap \
-  -o eval/runs/manual/no_cap.json
-```
-
-Print funnel + ablation tables:
+Or run variants yourself and compare:
 
 ```bash
 python3 eval/summarize_run.py --compare \
-  eval/runs/manual/full.json \
-  eval/runs/manual/no_refinement.json \
-  eval/runs/manual/no_cap.json
+  eval/runs/full.json \
+  eval/runs/no_refinement.json \
+  eval/runs/no_cap.json
 ```
 
-Each results JSON stores `run.elapsed_seconds` and config flags for cost reporting.
+Flags: `--no-search-refinement`, `--no-per-node-cap`, `--run-label NAME`.
 
-## Hour 2 — Human rubric
+## After the demo
 
-Export kept cards to a spreadsheet:
+Turn off stuff you're not using so Nebius doesn't keep billing:
 
-```bash
-python3 eval/export_rubric.py eval/runs/manual/full.json \
-  -o eval/runs/manual/rubric.csv
-```
-
-Score each row (1–5):
-
-| Column | Criterion |
-| --- | --- |
-| `specific_relevance_1_5` | How directly does this help the displayed problem / claim / detail? |
-| `actionability_1_5` | Would the author cite, compare, revise, or experiment? |
-| `non_redundancy_1_5` | Adds something distinct from other kept papers on that node? |
-
-Aggregate:
-
-```bash
-python3 eval/aggregate_scores.py eval/runs/manual/rubric.csv
-```
-
-**High-quality rate** = % of rated cards with relevance ≥ 4 and actionability ≥ 4.  
-**Redundancy rate** = % of rated cards with non-redundancy ≤ 2/5.
-
-A blank template lives at `eval/rubric_template.csv`.
-
-## Hour 3 — Presentation
-
-Use this framing sentence:
-
-> We evaluate final suggestions by human ratings on specific relevance,
-> actionability, and non-redundancy — not vector similarity alone.
-
-Report honestly: “pilot eval, n=15–20 cards across 1–2 papers.”
-
-Record Nebius cost from the console for the runs you just did (endpoint uptime while judging, Postgres already provisioned).
-
-## Teardown (after demo)
-
-When you are done with the challenge demo:
-
-1. Stop or delete the Qwen Serverless Endpoint if you do not need it running.
-2. Delete or scale down Managed Postgres if you no longer need the live index.
-3. Remove Object Storage preload artifacts if Postgres is your only backend.
-4. Rotate any API keys that were used on a shared machine.
-
-This keeps spend predictable and signals operational discipline in the writeup.
+1. Stop the Qwen endpoint
+2. Scale down or delete Postgres if you don't need the index live
+3. Delete Object Storage preload files if Postgres is enough
+4. Rotate keys if you ran this on a shared machine

@@ -462,7 +462,7 @@ When the challenge demo is complete:
 3. Remove Object Storage preload artifacts if Postgres is your only backend.
 4. Rotate API keys that were used on a shared machine.
 
-See also [`eval/README.md`](eval/README.md) for the pilot eval workflow.
+See [`eval/README.md`](eval/README.md) for the eval scripts.
 
 ## Run the pipeline
 
@@ -505,58 +505,61 @@ Use `--run-label NAME` to tag results JSON for eval comparisons.
 
 ## Pilot evaluation
 
-Pilot case study on CBAM (`1807.06521`). We report pipeline selectivity from
-the full run and human ratings on all 25 final suggestions (single-rater,
-1–5 scale).
+Ran the full pipeline on CBAM (`1807.06521`) and scored all 25 final
+suggestions by hand (1–5, one rater).
 
-### Pipeline funnel (automatic)
+### Demo output
+
+Suggestion cards from the CBAM run (`output/full_run_results_cards.html`):
+
+![CBAM overview — problem-level suggestions](docs/demo/cbam_overview.png)
+
+Claim-level suggestions, including papers that challenge or extend the draft:
+
+![CBAM claim-level suggestions](docs/demo/cbam_claims.png)
+
+Implementation-level alternatives for a specific mechanism:
+
+![CBAM implementation-level suggestions](docs/demo/cbam_implementation.png)
+
+Example card (relation label + takeaway):
+
+![Single suggestion card](docs/demo/cbam_card_detail.png)
+
+### Pipeline funnel
 
 | Stage | Count |
 | --- | ---: |
 | Retrieved candidates | 192 |
-| Abstract screen → full-text review | 73 |
-| Full-text judge → accepted (pre-cap) | 58 |
-| Per-node cap → final suggestions | 25 |
-| Final suggestions from agentic refinement | 11 |
-| Source contamination | 0 |
-
-Reproduce:
+| Passed abstract screen | 73 |
+| Kept after full-text judge | 58 |
+| Final suggestions (after per-node cap) | 25 |
+| Of those, from agentic refinement | 11 |
+| Input paper in results | 0 |
 
 ```bash
 python3 eval/summarize_run.py output/full_run_results.json
 ```
 
-### Human quality ratings
+### Human scores
 
-Every final suggestion was scored on **specific relevance**, **actionability**,
-and **non-redundancy** (1–5 scale, single rater). Raw scores with per-paper
-notes live in [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
+Scored on specific relevance, actionability, and non-redundancy. Per-paper
+scores and notes: [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
 
-| Metric | CBAM pilot |
+| Metric | CBAM |
 | --- | ---: |
-| Rated suggestions (n) | 25 |
-| High-quality rate (relevance ≥ 4 and actionability ≥ 4) | 100% |
+| Suggestions rated | 25 |
+| High-quality (relevance ≥ 4 and actionability ≥ 4) | 100% |
 | Mean specific relevance | 4.60 |
 | Mean actionability | 4.68 |
 | Mean non-redundancy | 4.48 |
-| Redundancy rate (non-redundancy ≤ 2) | 0% |
-
-Reproduce the aggregation:
+| Redundant (non-redundancy ≤ 2) | 0% |
 
 ```bash
 python3 eval/aggregate_scores.py eval/runs/cbam_rubric.csv
 ```
 
-> We evaluate final suggestions by human ratings on specific relevance,
-> actionability, and non-redundancy — not vector similarity alone.
-
-Full workflow (ablations, teardown): [`eval/README.md`](eval/README.md).
-
-Quick start on a new paper:
-
-```bash
-./eval/run_pilot.sh path/to/your_paper.pdf
-```
+More detail on the scripts: [`eval/README.md`](eval/README.md).
 
 Agentic search-refinement cost controls:
 
