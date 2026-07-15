@@ -1,6 +1,7 @@
-"""Two-stage Qwen judge for FAISS candidates.
+"""Two-stage Qwen judge for vector-search candidates.
 
-1) Cheap screen on title+abstract (batched): drop obvious junk, or mark read_full.
+1) Cheap screen on title+abstract grouped by retrieval query: drop obvious junk,
+   or mark read_full.
 2) For survivors: fetch the arXiv PDF, then one LLM call per paper with full text
    → keep/drop + relation + why.
 """
@@ -29,7 +30,6 @@ except ImportError:  # pragma: no cover
 load_local_env()
 
 DEFAULT_JUDGE_MODEL = os.getenv("JUDGE_MODEL", os.getenv("EXTRACTION_MODEL", "qwen3:32b"))
-DEFAULT_SCREEN_BATCH_SIZE = int(os.getenv("JUDGE_SCREEN_BATCH_SIZE", "8"))
 DEFAULT_PDF_MAX_CHARS = int(os.getenv("JUDGE_PDF_MAX_CHARS", "60000"))
 DEFAULT_ARXIV_DELAY = float(os.getenv("ARXIV_REQUEST_DELAY", "1.0"))
 ARXIV_USER_AGENT = os.getenv(
@@ -108,7 +108,7 @@ class ScreenJudgment(SchemaModel):
         return value.strip()
 
 
-class ScreenBatchResult(SchemaModel):
+class ScreenQueryResult(SchemaModel):
     judgments: list[ScreenJudgment] = Field(min_length=1)
 
 
@@ -126,41 +126,87 @@ class CandidateJudgment(SchemaModel):
         return value.strip()
 
 
-SCREEN_SYSTEM_PROMPT = """You are a fast triage judge for EmbedXiv related-work retrieval.
+SCREEN_SYSTEM_PROMPT = """You run a first-pass filter on candidate papers to find
+research that could help improve, refine, support, extend, qualify, or challenge
+the author's work—not merely papers in the same field.
 
-You see only title + abstract (plus which search queries matched). Do NOT invent
-details that are not in the abstract.
+A source paper has been decomposed into: a research problem, conceptual claims
+that address it, and concrete implementation details under each claim. Vector
+search returned candidates for ONE source query at a time. You see the source
+query, its source node and functional role when available, and the full list of
+candidates returned for that query with rank/distance.
 
-For EACH candidate choose:
-- drop: clearly irrelevant, wrong area, or only shared buzzwords
-- read_full: plausible enough that reading the PDF is worth it
+Your job: decide whether the full PDF might contain ideas, evidence, methods, or
+critiques the author could actually use when revising or strengthening their
+paper.
 
-Be aggressive about dropping weak matches. Prefer read_full when the abstract
-credibly engages the same problem, claim, or mechanism role.
+Be selective. Most vector-search hits are topical neighbors, not usable research
+for this author. Prefer drop unless the abstract clearly suggests a concrete
+payoff.
 
-Return one judgment per provided arxiv_id. Do not invent or omit ids.
+For EACH candidate choose exactly one:
+- drop: wrong area, only shared buzzwords/keywords, vague topical overlap, or no
+  credible way this paper could inform the source problem, claims, or mechanisms
+- read_full: the abstract suggests a specific, usable connection—same gap with a
+  distinctive take, evidence for/against a named claim, or an alternative
+  mechanism for a similar role that the author could learn from
+
+Rules:
+- Do not invent details absent from the title/abstract.
+- Prefer drop when the match looks lexical or topical only (same field, same
+  architecture family, shared dataset/benchmark, different question).
+- Prefer drop when you cannot name what the author would take from this paper.
+- Prefer read_full only when the abstract suggests usable insight beyond "also
+  does attention / CNN / transformers / vision."
+- Return one judgment per provided arxiv_id. Do not invent or omit ids.
 """
 
 
-FULL_SYSTEM_PROMPT = """You are a careful research literature judge for EmbedXiv.
+FULL_SYSTEM_PROMPT = """You judge whether ONE candidate paper is useful for the
+author's research—not just related by topic, but something they could apply to
+improve, refine, support, extend, qualify, or challenge their paper.
 
 You are given:
-1. The source paper's extracted structure: problem → claims → implementation details.
-2. ONE arXiv candidate: metadata, which queries matched it, and its full paper text
-   (possibly truncated).
+1. The source paper's extracted structure: problem → claims → implementation
+   details (with functional roles).
+2. One arXiv candidate: metadata, matched queries, and its full text (may be
+   truncated).
+
+Keep should be rare. Keep only if you can name a concrete takeaway for the
+author (a method to try, evidence to cite, caveat to address, competing
+approach to compare, or mechanism to borrow). If the paper is merely in the
+same neighborhood (attention, CNNs, vision, similar datasets) without that
+payoff, drop it.
 
 Decide:
 - decision: keep or drop
-- relation (single best):
-  same_problem | claim_support | claim_extension | claim_qualification |
-  claim_contradiction | implementation_alternative | irrelevant
-- primary_level: problem | claim | implementation
-- why: one concrete sentence
+- relation (single best label):
+  same_problem — addresses the same research gap; helps situate or sharpen the
+    source problem
+  claim_support — provides evidence or argument that backs a source claim
+  claim_extension — builds on or generalizes a source claim the author could adopt
+  claim_qualification — limits or conditions a source claim the author should heed
+  claim_contradiction — challenges a source claim the author must address
+  implementation_alternative — different mechanism for a similar functional role
+    the author could compare or borrow from
+  irrelevant — no meaningful way to use this paper
+- primary_level: problem | claim | implementation (where the usefulness is strongest)
+- why: one concrete sentence on what the author could take from this paper
 
 Rules:
-- Use the full text; do not rely on the abstract alone when they conflict.
-- irrelevant must use decision=drop.
-- Prefer drop when the connection is superficial.
+- Use the full text; if abstract and body conflict, trust the body.
+- For claim_* relations: the paper must engage that specific claim, not just the
+  broad problem area.
+- For implementation_alternative: the candidate must serve a similar functional
+  role with a meaningfully different mechanism—not a near-duplicate or rename.
+- Keep only when the author would change how they write, experiment, or argue
+  after reading this paper.
+- Drop when the overlap is only shared field, architecture family, dataset, or
+  keywords.
+- Drop near-duplicates of the source idea that add little the author does not
+  already claim.
+- relation=irrelevant requires decision=drop.
+- Prefer drop on borderline matches.
 """
 
 
@@ -207,6 +253,114 @@ def _candidate_abstract_block(candidate: dict[str, Any]) -> str:
     )
 
 
+def _screen_query_block(match: dict[str, Any]) -> str:
+    if match.get("query_type") == "unmatched":
+        return "SOURCE QUERY\n(no matched query provenance)"
+    lines = [
+        "SOURCE QUERY",
+        f"level: {match.get('level', '')}",
+        f"query_type: {match.get('query_type', '')}",
+        f"query: {_truncate(str(match.get('query', '')), 500)}",
+        f"source_text: {_truncate(str(match.get('source_text', '')), 500)}",
+    ]
+    if match.get("functional_role"):
+        lines.append(
+            f"functional_role: {_truncate(str(match.get('functional_role')), 500)}"
+        )
+    for key in (
+        "problem_index",
+        "claim_index",
+        "detail_index",
+        "target_id",
+        "refinement_round",
+    ):
+        if match.get(key) is not None:
+            lines.append(f"{key}: {match.get(key)}")
+    return "\n".join(lines)
+
+
+def _candidate_screen_block(
+    candidate: dict[str, Any],
+    match: dict[str, Any],
+) -> str:
+    distance = match.get("distance", candidate.get("best_distance", ""))
+    rank = match.get("rank", candidate.get("best_rank", ""))
+    return (
+        f"arxiv_id: {candidate.get('arxiv_id', '')}\n"
+        f"title: {_truncate(str(candidate.get('title', '')), 300)}\n"
+        f"abstract: {_truncate(str(candidate.get('abstract', '')), 1200)}\n"
+        f"query_rank: {rank}\n"
+        f"query_distance: {distance}\n"
+        f"best_distance: {candidate.get('best_distance', '')}\n"
+        f"all_matched_queries: {_match_summary(candidate)}"
+    )
+
+
+def _query_group_key(match: dict[str, Any]) -> tuple:
+    return (
+        match.get("level"),
+        match.get("query_type"),
+        match.get("query"),
+        match.get("source_text"),
+        match.get("functional_role"),
+        match.get("problem_index"),
+        match.get("claim_index"),
+        match.get("detail_index"),
+        match.get("target_id"),
+        match.get("refinement_round"),
+    )
+
+
+def _screen_query_groups(
+    candidates: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]]]:
+    """Group candidates by the source query that retrieved them."""
+    groups: dict[
+        tuple,
+        tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]],
+    ] = {}
+    unmatched = {
+        "level": "unknown",
+        "query_type": "unmatched",
+        "query": "",
+        "source_text": "",
+    }
+    for candidate in candidates:
+        matches = [
+            match
+            for match in candidate.get("matched_queries") or []
+            if isinstance(match, dict)
+        ]
+        if not matches:
+            matches = [unmatched]
+        for match in matches:
+            key = _query_group_key(match)
+            if key not in groups:
+                groups[key] = (match, [])
+            groups[key][1].append((candidate, match))
+
+    output = []
+    for match, group_candidates in groups.values():
+        deduped = {}
+        for candidate, candidate_match in group_candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "")).strip()
+            if arxiv_id and arxiv_id not in deduped:
+                deduped[arxiv_id] = (candidate, candidate_match)
+        output.append(
+            (
+                match,
+                sorted(
+                    deduped.values(),
+                    key=lambda item: (
+                        item[1].get("rank", item[0].get("best_rank", 10_000)),
+                        item[1].get("distance", item[0].get("best_distance", 1e9)),
+                    ),
+                ),
+            )
+        )
+    return output
+
+
 def arxiv_pdf_url(arxiv_id: str) -> str:
     return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
@@ -237,24 +391,34 @@ def fetch_arxiv_pdf_text(
     return text[:max_chars]
 
 
-def screen_batch(
+def screen_query_candidates(
     problems: list[ResearchProblem],
-    batch: list[dict[str, Any]],
+    query_match: dict[str, Any],
+    candidate_matches: list[tuple[dict[str, Any], dict[str, Any]]],
     *,
     client: OpenAI | None = None,
     model: str = DEFAULT_JUDGE_MODEL,
 ) -> list[ScreenJudgment]:
     if not problems:
         raise ValueError("problems must not be empty")
-    if not batch:
+    if not candidate_matches:
         return []
 
-    user_parts = [_extraction_context(problems), "", "CANDIDATES"]
-    for index, candidate in enumerate(batch):
+    user_parts = [
+        _extraction_context(problems),
+        "",
+        _screen_query_block(query_match),
+        "",
+        "CANDIDATES RETURNED FOR THIS QUERY",
+    ]
+    for index, (candidate, match) in enumerate(candidate_matches):
         user_parts.append(f"--- candidate {index + 1} ---")
-        user_parts.append(_candidate_abstract_block(candidate))
+        user_parts.append(_candidate_screen_block(candidate, match))
     user_parts.append("")
-    user_parts.append("Return one screen judgment per arxiv_id above.")
+    user_parts.append(
+        "Return one screen judgment per arxiv_id above, judging this candidate "
+        "in the context of the source query and its full candidate list."
+    )
 
     completion = (client or get_client()).beta.chat.completions.parse(
         model=model,
@@ -263,7 +427,7 @@ def screen_batch(
             {"role": "system", "content": SCREEN_SYSTEM_PROMPT},
             {"role": "user", "content": "\n".join(user_parts)},
         ],
-        response_format=ScreenBatchResult,
+        response_format=ScreenQueryResult,
     )
     result = completion.choices[0].message.parsed
     if result is None:
@@ -271,7 +435,7 @@ def screen_batch(
 
     by_id = {item.arxiv_id: item for item in result.judgments}
     aligned: list[ScreenJudgment] = []
-    for candidate in batch:
+    for candidate, _match in candidate_matches:
         arxiv_id = str(candidate.get("arxiv_id", "")).strip()
         if not arxiv_id:
             continue
@@ -287,6 +451,21 @@ def screen_batch(
         else:
             aligned.append(judgment)
     return aligned
+
+
+def _merge_screen_judgment(
+    screens: dict[str, ScreenJudgment],
+    judgment: ScreenJudgment,
+) -> None:
+    """Keep read_full if any retrieval query makes the candidate worth reading."""
+    existing = screens.get(judgment.arxiv_id)
+    if existing is None:
+        screens[judgment.arxiv_id] = judgment
+        return
+    if existing.decision == "read_full":
+        return
+    if judgment.decision == "read_full":
+        screens[judgment.arxiv_id] = judgment
 
 
 def judge_full_paper(
@@ -341,7 +520,6 @@ def judge_candidates(
     *,
     client: OpenAI | None = None,
     model: str = DEFAULT_JUDGE_MODEL,
-    batch_size: int = DEFAULT_SCREEN_BATCH_SIZE,
     fetch_pdfs: bool = True,
     session: requests.Session | None = None,
     request_delay: float = DEFAULT_ARXIV_DELAY,
@@ -349,23 +527,26 @@ def judge_candidates(
     pdf_text_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Screen on abstracts, then full-text judge survivors one paper at a time."""
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
     if not problems:
         raise ValueError("problems must not be empty")
 
     screens: dict[str, ScreenJudgment] = {}
     total = len(candidates)
-    batch_starts = list(range(0, total, batch_size))
-    for start in _progress(
-        batch_starts,
-        total=len(batch_starts),
+    query_groups = _screen_query_groups(candidates)
+    for query_match, candidate_matches in _progress(
+        query_groups,
+        total=len(query_groups),
         desc="Screen",
-        unit="batch",
+        unit="query",
     ):
-        batch = candidates[start : start + batch_size]
-        for judgment in screen_batch(problems, batch, client=client, model=model):
-            screens[judgment.arxiv_id] = judgment
+        for judgment in screen_query_candidates(
+            problems,
+            query_match,
+            candidate_matches,
+            client=client,
+            model=model,
+        ):
+            _merge_screen_judgment(screens, judgment)
 
     read_full_count = 0
     for candidate in candidates:
@@ -467,7 +648,6 @@ def main() -> None:
     )
     parser.add_argument("results_json", type=Path)
     parser.add_argument("-o", "--output", type=Path)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_SCREEN_BATCH_SIZE)
     parser.add_argument("--kept-only", action="store_true")
     parser.add_argument("--no-pdf", action="store_true", help="Screen only; no PDF fetch")
     args = parser.parse_args()
@@ -481,7 +661,6 @@ def main() -> None:
     judged = judge_candidates(
         problems,
         candidates,
-        batch_size=args.batch_size,
         fetch_pdfs=not args.no_pdf,
     )
     if args.kept_only:

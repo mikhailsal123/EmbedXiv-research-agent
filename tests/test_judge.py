@@ -7,8 +7,8 @@ from unittest.mock import patch
 from extract_claims import ConceptualClaim, ResearchProblem
 from judge_candidates import (
     CandidateJudgment,
-    ScreenBatchResult,
     ScreenJudgment,
+    ScreenQueryResult,
     judge_candidates,
     kept_candidates,
 )
@@ -78,13 +78,17 @@ class JudgeTests(unittest.TestCase):
         ]
 
     def test_screen_drops_then_full_text_keeps_survivor(self):
-        screen = ScreenBatchResult(
+        screen = ScreenQueryResult(
             judgments=[
                 ScreenJudgment(
                     arxiv_id="2301.00001",
                     decision="read_full",
                     why="Same scarce-label gap.",
                 ),
+            ]
+        )
+        unmatched_screen = ScreenQueryResult(
+            judgments=[
                 ScreenJudgment(
                     arxiv_id="2301.00002",
                     decision="drop",
@@ -99,17 +103,16 @@ class JudgeTests(unittest.TestCase):
             why="Full text confirms the same problem framing.",
             primary_level="problem",
         )
-        client = FakeClient([screen, full])
+        client = FakeClient([screen, unmatched_screen, full])
         judged = judge_candidates(
             self.problems,
             self.candidates,
             client=client,
-            batch_size=8,
             fetch_pdfs=True,
             pdf_text_by_id={"2301.00001": "Full paper body about scarce labels."},
             request_delay=0.0,
         )
-        self.assertEqual(len(client.completions.calls), 2)
+        self.assertEqual(len(client.completions.calls), 3)
         self.assertEqual(judged[0]["screen"]["decision"], "read_full")
         self.assertEqual(judged[0]["judgment"]["decision"], "keep")
         self.assertEqual(judged[0]["judgment"]["stage"], "full_text")
@@ -118,10 +121,19 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(len(kept_candidates(judged)), 1)
 
     def test_missing_screen_entry_is_dropped(self):
-        screen = ScreenBatchResult(
+        screen = ScreenQueryResult(
             judgments=[
                 ScreenJudgment(
-                    arxiv_id="2301.00001",
+                    arxiv_id="2301.00002",
+                    decision="drop",
+                    why="Different group.",
+                )
+            ]
+        )
+        unmatched_screen = ScreenQueryResult(
+            judgments=[
+                ScreenJudgment(
+                    arxiv_id="2301.00002",
                     decision="drop",
                     why="Weak.",
                 )
@@ -130,10 +142,10 @@ class JudgeTests(unittest.TestCase):
         judged = judge_candidates(
             self.problems,
             self.candidates,
-            client=FakeClient([screen]),
+            client=FakeClient([screen, unmatched_screen]),
             fetch_pdfs=False,
         )
-        self.assertEqual(judged[1]["judgment"]["decision"], "drop")
+        self.assertEqual(judged[0]["judgment"]["decision"], "drop")
 
 
 if __name__ == "__main__":

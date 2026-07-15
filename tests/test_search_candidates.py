@@ -1,4 +1,4 @@
-"""Tests for SPECTER2 query mapping, FAISS candidate search, and S2 enrichment."""
+"""Tests for SPECTER2 query mapping, vector candidate search, and S2 enrichment."""
 
 import tempfile
 import unittest
@@ -145,7 +145,7 @@ class QueryGenerationTests(unittest.TestCase):
         self.assertEqual(len(candidates[0]["matched_queries"]), 5)
         self.assertEqual(len(index.queries), 5)
 
-    def test_excludes_source_arxiv_id_from_faiss_hits(self):
+    def test_excludes_source_arxiv_id_from_vector_hits(self):
         hits = [
             {
                 "arxiv_id": "1807.06521",

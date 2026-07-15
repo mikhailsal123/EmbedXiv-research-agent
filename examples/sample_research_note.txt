@@ -1,0 +1,29 @@
+Title: Adaptive Sparse Routing for Long-Context Code Review
+
+Long-context code review agents often spend most of their compute budget on
+files that are only weakly related to the requested change. This creates two
+failure modes: the model misses small but important interactions in the relevant
+files, and the review becomes too expensive to run repeatedly during
+development.
+
+We propose an adaptive sparse-routing architecture for repository review. The
+main idea is to learn a lightweight routing policy that selects a small set of
+files and symbols for full-context analysis while keeping a compressed summary
+of the rest of the repository available for consistency checks.
+
+The system first builds a dependency graph over files, exported symbols, test
+targets, and recent edits. A small transformer scores graph neighborhoods using
+the user request, changed files, import edges, call edges, and failing-test
+messages. Only the highest-scoring neighborhoods are expanded into the main
+review context. The remaining files are represented by cached function-level
+summaries and interface signatures.
+
+To prevent the router from hiding important evidence, the reviewer model can
+issue retrieval requests during analysis. These requests trigger a second pass
+over the repository graph and add missing files to the context when the model
+detects unresolved references, unverified assumptions, or likely test coverage
+gaps.
+
+We evaluate the method on historical bug-fix pull requests. Compared with a
+fixed top-k retrieval baseline, adaptive sparse routing uses less context while
+finding more cross-file regressions and producing fewer irrelevant comments.

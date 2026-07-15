@@ -1,4 +1,4 @@
-"""GPU Job: embed preloaded arXiv metadata with SPECTER2 and publish FAISS.
+"""GPU Job: embed preloaded arXiv metadata with SPECTER2 and publish corpus.
 
 Expects metadata.sqlite already in Object Storage (from datagen.preload_metadata),
 mounted at INDEX_OUTPUT_DIR (default /output/arxiv-index).
@@ -8,12 +8,14 @@ mounted at INDEX_OUTPUT_DIR (default /output/arxiv-index).
 
 from __future__ import annotations
 
-import hashlib
-import shutil
 import json
+import hashlib
+import math
+import multiprocessing
 import os
 import random
 import re
+import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -311,6 +313,204 @@ class Specter2Encoder:
         return self._encode(texts, adapter=self.query_adapter, batch_size=batch_size)
 
 
+def _normalize_cuda_device(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("CUDA device name must not be empty")
+    if value.startswith("cuda:"):
+        return value
+    if value.isdigit():
+        return f"cuda:{value}"
+    raise ValueError(f"Unsupported CUDA device name: {value!r}")
+
+
+def parse_cuda_devices(value: str | None) -> list[str]:
+    """Parse EMBED_CUDA_DEVICES-style values into torch device names."""
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return []
+    return [_normalize_cuda_device(part) for part in value.split(",")]
+
+
+def available_cuda_devices() -> list[str]:
+    try:
+        import torch
+    except ImportError:
+        return []
+    if not torch.cuda.is_available():
+        return []
+    return [f"cuda:{index}" for index in range(torch.cuda.device_count())]
+
+
+def _contiguous_chunks(length: int, parts: int) -> list[tuple[int, int]]:
+    if length < 0:
+        raise ValueError("length must be non-negative")
+    if parts < 1:
+        raise ValueError("parts must be positive")
+    if length == 0:
+        return []
+    width = math.ceil(length / parts)
+    return [
+        (start, min(start + width, length))
+        for start in range(0, length, width)
+    ]
+
+
+def _document_worker_main(
+    connection: object,
+    device: str,
+    revision: str,
+) -> None:
+    try:
+        encoder = Specter2Encoder(device=device, revision=revision)
+        connection.send(("ready", encoder.dimension, encoder.fingerprint))
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            kind, texts, batch_size = request
+            if kind == "documents":
+                vectors = encoder.encode_documents(texts, batch_size=batch_size)
+            elif kind == "queries":
+                vectors = encoder.encode_queries(texts, batch_size=batch_size)
+            else:
+                raise ValueError(f"Unknown worker request kind: {kind!r}")
+            connection.send(("ok", vectors))
+    except Exception:
+        import traceback
+
+        connection.send(("error", traceback.format_exc()))
+    finally:
+        connection.close()
+
+
+class MultiGpuSpecter2Encoder:
+    """SPECTER2 encoder that splits batches across per-GPU worker processes."""
+
+    dimension = DIMENSION
+
+    def __init__(
+        self,
+        devices: Sequence[str],
+        *,
+        revision: str = "main",
+    ) -> None:
+        if len(devices) < 2:
+            raise ValueError("MultiGpuSpecter2Encoder needs at least two devices")
+        self.devices = list(devices)
+        self._connections = []
+        self._processes = []
+        context = multiprocessing.get_context("spawn")
+        try:
+            for device in self.devices:
+                parent, child = context.Pipe()
+                process = context.Process(
+                    target=_document_worker_main,
+                    args=(child, device, revision),
+                    daemon=True,
+                )
+                process.start()
+                child.close()
+                self._connections.append(parent)
+                self._processes.append(process)
+
+            fingerprints = set()
+            for connection in self._connections:
+                status, *payload = connection.recv()
+                if status != "ready":
+                    raise RuntimeError(
+                        f"SPECTER2 CUDA worker failed:\n{payload[0]}"
+                    )
+                dimension, fingerprint = payload
+                if dimension != self.dimension:
+                    raise ValueError("Unexpected SPECTER2 worker dimension")
+                fingerprints.add(fingerprint)
+            if len(fingerprints) != 1:
+                raise RuntimeError("SPECTER2 workers loaded different revisions")
+            self.fingerprint = fingerprints.pop()
+        except Exception:
+            self.close()
+            raise
+
+    def _encode(
+        self,
+        texts: Sequence[str],
+        *,
+        kind: str,
+        batch_size: int,
+    ) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dimension), dtype=np.float32)
+        active = min(len(self._connections), len(texts))
+        chunks = _contiguous_chunks(len(texts), active)
+        # Contiguous chunks plus ordered receives preserve input/vector order.
+        for connection, (start, end) in zip(self._connections, chunks):
+            connection.send((kind, list(texts[start:end]), batch_size))
+
+        matrices = []
+        for connection in self._connections[: len(chunks)]:
+            status, payload = connection.recv()
+            if status != "ok":
+                raise RuntimeError(f"SPECTER2 CUDA worker failed:\n{payload}")
+            matrices.append(payload)
+        return np.ascontiguousarray(np.concatenate(matrices), dtype=np.float32)
+
+    def encode_documents(
+        self, texts: Sequence[str], batch_size: int = 32
+    ) -> np.ndarray:
+        return self._encode(texts, kind="documents", batch_size=batch_size)
+
+    def encode_queries(
+        self, texts: Sequence[str], batch_size: int = 32
+    ) -> np.ndarray:
+        return self._encode(texts, kind="queries", batch_size=batch_size)
+
+    def close(self) -> None:
+        for connection, process in zip(
+            getattr(self, "_connections", []),
+            getattr(self, "_processes", []),
+        ):
+            try:
+                if process.is_alive():
+                    connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        for process in getattr(self, "_processes", []):
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        for connection in getattr(self, "_connections", []):
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self._connections = []
+        self._processes = []
+
+
+def create_document_encoder(
+    *,
+    device: str = "cuda",
+    revision: str = "main",
+    cuda_devices: Sequence[str] | None = None,
+) -> Encoder:
+    """Create the corpus document encoder, using all CUDA GPUs when available."""
+    configured = list(cuda_devices or [])
+    if not configured and device.startswith("cuda"):
+        configured = parse_cuda_devices(os.getenv("EMBED_CUDA_DEVICES"))
+        if not configured and device == "cuda":
+            configured = available_cuda_devices()
+    if device.startswith("cuda") and len(configured) > 1:
+        print(
+            "Using multi-GPU SPECTER2 document encoding on "
+            + ", ".join(configured),
+            flush=True,
+        )
+        return MultiGpuSpecter2Encoder(configured, revision=revision)
+    single_device = configured[0] if configured else device
+    return Specter2Encoder(device=single_device, revision=revision)
+
+
 
 def _next_shard_number(shard_dir: Path) -> int:
     numbers = []
@@ -371,14 +571,10 @@ def embed_pending(
 
     # Update only after a shard is fully encoded + persisted so failures cannot
     # advance the bar past work that will be retried.
-    if tqdm is None:
-        progress = None
-        print(
-            "tqdm is not installed; progress bar disabled "
-            "(pip install tqdm or rebuild the Job image)",
-            flush=True,
-        )
-    else:
+    # Nebius Job logs ignore tqdm's \r line rewrites — use newline prints unless
+    # stdout is an interactive TTY.
+    use_tqdm = tqdm is not None and sys.stdout.isatty()
+    if use_tqdm:
         progress = tqdm(
             total=total,
             unit="paper",
@@ -389,6 +585,18 @@ def embed_pending(
             ascii=True,
             leave=True,
         )
+    else:
+        progress = None
+        if tqdm is None:
+            print(
+                "tqdm is not installed; using newline progress logs",
+                flush=True,
+            )
+        else:
+            print(
+                "Non-interactive stdout (Job logs): printing progress per shard",
+                flush=True,
+            )
     try:
         for shard_start in range(0, len(rows), shard_size):
             shard_rows = rows[shard_start : shard_start + shard_size]
@@ -469,8 +677,9 @@ def embed_pending(
                 progress.set_postfix(shard=next_shard - 1, refresh=False)
             else:
                 print(
-                    f"Embedded {embedded:,}/{total:,} "
-                    f"({100.0 * embedded / total:.1f}%)",
+                    f"SPECTER2 embed: {embedded:,}/{total:,} "
+                    f"({100.0 * embedded / total:.1f}%) "
+                    f"shard={next_shard - 1}",
                     flush=True,
                 )
     finally:
@@ -533,7 +742,75 @@ def require_database_url() -> str:
     url = database_url()
     if not url:
         raise RuntimeError("Set DATABASE_URL in the Job environment")
-    return url
+    return normalize_database_url(url)
+
+
+def normalize_database_url(url: str) -> str:
+    """Make Nebius Managed Postgres URLs work in Job containers.
+
+    ``sslmode=verify-full`` looks for ``~/.postgresql/root.crt``. Job images
+    usually lack that file, so we install the Nebius MSP CA before connecting.
+    Prefer an explicit CA file path over ``sslrootcert=system`` (system trust
+    often fails against Nebius MSP certs).
+    """
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    sslmode = (query.get("sslmode") or "").lower()
+    if sslmode in {"verify-full", "verify-ca"}:
+        # Drop broken/unsupported system trust when present; use Nebius CA file.
+        if query.get("sslrootcert") == "system":
+            query.pop("sslrootcert", None)
+        if "sslrootcert" not in query:
+            ca_path = ensure_nebius_msp_ca()
+            if ca_path is not None:
+                query["sslrootcert"] = str(ca_path)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def ensure_nebius_msp_ca() -> Path | None:
+    """Download Nebius MSP CA into ~/.postgresql/root.crt when missing."""
+    ca_dir = Path(
+        os.getenv("PGSSLROOTCERT_DIR", str(Path.home() / ".postgresql"))
+    )
+    ca_path = ca_dir / "root.crt"
+    if ca_path.is_file() and ca_path.stat().st_size > 0:
+        return ca_path
+
+    urls = [
+        os.getenv("NEBIUS_MSP_CA_URL", "").strip(),
+        "https://storage.us-central1.nebius.cloud/msp-certs/ca.pem",
+        "https://storage.eu-north1.nebius.cloud/msp-certs/ca.pem",
+    ]
+    try:
+        import urllib.request
+    except ImportError:
+        return None
+
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for url in urls:
+        if not url:
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                payload = response.read()
+            if not payload:
+                continue
+            ca_path.write_bytes(payload)
+            ca_path.chmod(0o600)
+            print(f"Installed Nebius MSP CA at {ca_path}", flush=True)
+            return ca_path
+        except Exception as exc:  # pragma: no cover - network/env dependent
+            last_error = exc
+    if last_error is not None:
+        print(
+            f"Could not download Nebius MSP CA ({last_error}); "
+            "falling back to sslrootcert=system",
+            flush=True,
+        )
+    return None
 
 
 def connect_pg():
@@ -546,6 +823,57 @@ def connect_pg():
         ) from exc
 
     return psycopg.connect(require_database_url(), row_factory=dict_row)
+
+
+def probe_postgres() -> None:
+    """Fail fast if DATABASE_URL cannot connect (before hours of embedding)."""
+    print("Probing Postgres connection…", flush=True)
+    connection = connect_pg()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 AS ok")
+            row = cursor.fetchone()
+            if not row or int(row["ok"]) != 1:
+                raise RuntimeError("Postgres probe returned an unexpected result")
+        print("Postgres connection OK", flush=True)
+    finally:
+        connection.close()
+
+
+def checkpoint_dir() -> Path:
+    return OUTPUT_DIR / "embed-checkpoint"
+
+
+def save_embed_checkpoint(work_dir: Path) -> Path:
+    """Persist SQLite + shards onto the bucket mount so publish retries survive."""
+    destination = checkpoint_dir()
+    destination.mkdir(parents=True, exist_ok=True)
+    shard_src = work_dir / "shards"
+    shard_dst = destination / "shards"
+    if shard_dst.exists():
+        shutil.rmtree(shard_dst)
+    if shard_src.is_dir():
+        shutil.copytree(shard_src, shard_dst)
+    shutil.copyfile(work_dir / "metadata.sqlite", destination / "metadata.sqlite")
+    print(f"Saved embed checkpoint to {destination}", flush=True)
+    return destination
+
+
+def restore_embed_checkpoint(work_dir: Path) -> bool:
+    """Restore a previous embed checkpoint into the local work dir if present."""
+    source = checkpoint_dir()
+    db_path = source / "metadata.sqlite"
+    shard_src = source / "shards"
+    if not db_path.is_file() or not shard_src.is_dir():
+        return False
+    work_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(db_path, work_dir / "metadata.sqlite")
+    shard_dst = work_dir / "shards"
+    if shard_dst.exists():
+        shutil.rmtree(shard_dst)
+    shutil.copytree(shard_src, shard_dst)
+    print(f"Restored embed checkpoint from {source}", flush=True)
+    return True
 
 
 def pg_vector_literal(vector: Sequence[float] | np.ndarray) -> str:
@@ -944,6 +1272,9 @@ def main() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
     use_postgres = bool(database_url())
+    if use_postgres:
+        # Fail before spending GPU hours if SSL/credentials are wrong.
+        probe_postgres()
 
     preload_db = OUTPUT_DIR / "metadata.sqlite"
     ready = OUTPUT_DIR / "PRELOAD_READY.json"
@@ -954,19 +1285,25 @@ def main() -> None:
     if not ready.is_file():
         raise RuntimeError(f"Missing {ready}. Preload did not finish cleanly.")
 
-    # Copy preload into workspace so shards stay off the bucket until publish.
-    work_db = WORK_DIR / "metadata.sqlite"
-    if work_db.resolve() != preload_db.resolve():
-        shutil.copyfile(preload_db, work_db)
+    # Prefer a prior embed checkpoint on the bucket mount (survives Job failure).
+    restored = False
+    if use_postgres:
+        restored = restore_embed_checkpoint(WORK_DIR)
+    if not restored:
+        # Copy preload into workspace so shards stay off the bucket until checkpoint.
+        work_db = WORK_DIR / "metadata.sqlite"
+        if work_db.resolve() != preload_db.resolve():
+            shutil.copyfile(preload_db, work_db)
 
     connection = connect_database(WORK_DIR)
+    encoder: Encoder | None = None
     try:
         papers = connection.execute(
             "SELECT COUNT(*) FROM papers WHERE deleted = 0"
         ).fetchone()[0]
         print(f"Loaded preload with {papers:,} papers", flush=True)
 
-        encoder = Specter2Encoder(device="cuda")
+        encoder = create_document_encoder(device=os.getenv("EMBED_DEVICE", "cuda"))
         print("SPECTER2 encoder ready", flush=True)
         embedded = embed_pending(
             connection,
@@ -998,6 +1335,9 @@ def main() -> None:
         }
 
         if use_postgres:
+            # Persist shards+sqlite to the bucket mount before publish so a
+            # failed DB write can resume without re-embedding.
+            save_embed_checkpoint(WORK_DIR)
             print("Publishing embeddings to Postgres…", flush=True)
             summary = publish_postgres(
                 connection,
@@ -1020,6 +1360,8 @@ def main() -> None:
         )
         print("FAISS index written", flush=True)
     finally:
+        if encoder is not None and hasattr(encoder, "close"):
+            encoder.close()  # type: ignore[attr-defined]
         connection.close()
 
     summary = verify(WORK_DIR)

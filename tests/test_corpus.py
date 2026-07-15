@@ -1,4 +1,4 @@
-"""Tests for metadata preload and SPECTER2/FAISS embedding."""
+"""Tests for metadata preload and SPECTER2 corpus embedding."""
 
 import importlib.util
 import json
@@ -12,8 +12,12 @@ import numpy as np
 from datagen.embed_corpus import (
     DIMENSION,
     build_faiss_index,
+    create_document_encoder,
     embed_pending,
+    parse_cuda_devices,
+    normalize_database_url,
     pg_vector_literal,
+    _contiguous_chunks,
 )
 from datagen.preload_metadata import (
     ArxivPaper,
@@ -46,10 +50,95 @@ class FakeEncoder:
         return self._vectors(texts)
 
 
+class PostgresUrlTests(unittest.TestCase):
+    def test_normalize_adds_nebius_ca_for_verify_full(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ca_path = Path(directory) / "root.crt"
+            ca_path.write_text("CERT")
+            with patch(
+                "datagen.embed_corpus.ensure_nebius_msp_ca",
+                return_value=ca_path,
+            ):
+                normalized = normalize_database_url(
+                    "postgresql://u:p@host:5432/db?sslmode=verify-full"
+                )
+            self.assertIn("sslmode=verify-full", normalized)
+            self.assertIn("sslrootcert=", normalized)
+            self.assertNotIn("sslrootcert=system", normalized)
+
+    def test_normalize_replaces_system_trust_with_ca_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ca_path = Path(directory) / "root.crt"
+            ca_path.write_text("CERT")
+            with patch(
+                "datagen.embed_corpus.ensure_nebius_msp_ca",
+                return_value=ca_path,
+            ):
+                normalized = normalize_database_url(
+                    "postgresql://u:p@host:5432/db?"
+                    "sslmode=verify-full&sslrootcert=system"
+                )
+            self.assertIn("sslrootcert=", normalized)
+            self.assertNotIn("sslrootcert=system", normalized)
+            from urllib.parse import unquote
+
+            self.assertIn(str(ca_path), unquote(normalized))
+
+
 class PgVectorLiteralTests(unittest.TestCase):
     def test_pg_vector_literal_formats_floats(self):
         vector = np.array([0.1, 1.0, -2.5], dtype=np.float32)
         self.assertEqual(pg_vector_literal(vector), "[0.1,1,-2.5]")
+
+
+class MultiGpuEncoderSelectionTests(unittest.TestCase):
+    def test_parse_cuda_devices_accepts_all_empty_or_explicit_ids(self):
+        self.assertEqual(parse_cuda_devices(None), [])
+        self.assertEqual(parse_cuda_devices("all"), [])
+        self.assertEqual(
+            parse_cuda_devices("0,1,cuda:3"),
+            ["cuda:0", "cuda:1", "cuda:3"],
+        )
+
+    def test_contiguous_chunks_preserve_order_for_uneven_batches(self):
+        self.assertEqual(_contiguous_chunks(10, 3), [(0, 4), (4, 8), (8, 10)])
+        self.assertEqual(_contiguous_chunks(2, 8), [(0, 1), (1, 2)])
+
+    @patch("datagen.embed_corpus.Specter2Encoder")
+    @patch("datagen.embed_corpus.MultiGpuSpecter2Encoder")
+    @patch("datagen.embed_corpus.available_cuda_devices")
+    def test_create_document_encoder_uses_multi_gpu_when_available(
+        self, available, multi_gpu, single_gpu
+    ):
+        available.return_value = ["cuda:0", "cuda:1"]
+        encoder = create_document_encoder(device="cuda")
+        self.assertIs(encoder, multi_gpu.return_value)
+        multi_gpu.assert_called_once_with(["cuda:0", "cuda:1"], revision="main")
+        single_gpu.assert_not_called()
+
+    @patch("datagen.embed_corpus.Specter2Encoder")
+    @patch("datagen.embed_corpus.MultiGpuSpecter2Encoder")
+    @patch("datagen.embed_corpus.available_cuda_devices")
+    def test_create_document_encoder_keeps_single_gpu_path(
+        self, available, multi_gpu, single_gpu
+    ):
+        available.return_value = ["cuda:0"]
+        encoder = create_document_encoder(device="cuda")
+        self.assertIs(encoder, single_gpu.return_value)
+        single_gpu.assert_called_once_with(device="cuda:0", revision="main")
+        multi_gpu.assert_not_called()
+
+    @patch("datagen.embed_corpus.Specter2Encoder")
+    @patch("datagen.embed_corpus.MultiGpuSpecter2Encoder")
+    @patch("datagen.embed_corpus.available_cuda_devices")
+    def test_explicit_cuda_device_forces_single_gpu_path(
+        self, available, multi_gpu, single_gpu
+    ):
+        available.return_value = ["cuda:0", "cuda:1"]
+        encoder = create_document_encoder(device="cuda:0")
+        self.assertIs(encoder, single_gpu.return_value)
+        single_gpu.assert_called_once_with(device="cuda:0", revision="main")
+        multi_gpu.assert_not_called()
 
 
 class MetadataTests(unittest.TestCase):

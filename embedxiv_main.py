@@ -1,7 +1,7 @@
-"""Extract → FAISS search → judge → S2 graph recommend → judge again.
+"""Extract → vector search → judge → S2 graph recommend → judge again.
 
 Glue CLI for extract_claims.py + search_candidates.py + judge_candidates.py.
-The SPECTER2/FAISS corpus is loaded from Nebius Object Storage.
+Search uses Postgres/pgvector when DATABASE_URL is set, else FAISS fallback.
 """
 
 from __future__ import annotations
@@ -13,6 +13,14 @@ from pathlib import Path
 
 from extract_claims import extract_claims, read_pdf_text
 from judge_candidates import kept_candidates, judge_candidates
+from search_refinement import (
+    DEFAULT_REFINEMENT_FOLLOWUPS_PER_TARGET,
+    DEFAULT_REFINEMENT_LIMIT,
+    DEFAULT_REFINEMENT_MAX_ROUNDS,
+    DEFAULT_REFINEMENT_MAX_TARGETS,
+    DEFAULT_REFINEMENT_QUERIES_PER_TARGET,
+    run_search_refinement,
+)
 from search_candidates import (
     DEFAULT_REQUEST_DELAY,
     DEFAULT_S2_RECOMMEND_LIMIT,
@@ -28,6 +36,31 @@ from suggestion_cards import write_suggestion_outputs
 
 DEFAULT_OUTPUT_DIR = Path("output")
 DEFAULT_OUTPUT_JSON = DEFAULT_OUTPUT_DIR / "full_run_results.json"
+
+
+def _merge_candidates(
+    base: list[dict],
+    additions: list[dict],
+) -> list[dict]:
+    candidates_by_id = {candidate["arxiv_id"]: dict(candidate) for candidate in base}
+    for candidate in additions:
+        arxiv_id = candidate["arxiv_id"]
+        existing = candidates_by_id.get(arxiv_id)
+        if existing is None:
+            candidates_by_id[arxiv_id] = candidate
+            continue
+        existing["best_distance"] = min(
+            existing["best_distance"], candidate["best_distance"]
+        )
+        existing["best_rank"] = min(existing["best_rank"], candidate["best_rank"])
+        for match in candidate.get("matched_queries") or []:
+            if match not in existing["matched_queries"]:
+                existing["matched_queries"].append(match)
+    return sorted(
+        candidates_by_id.values(),
+        key=lambda candidate: (candidate["best_distance"], candidate["best_rank"]),
+    )
+
 
 def _print_judge_summary(label: str, candidates: list) -> None:
     screen_drop = 0
@@ -84,6 +117,41 @@ def main() -> None:
         help="Disable Semantic Scholar graph recommendations from kept papers",
     )
     parser.add_argument(
+        "--no-search-refinement",
+        action="store_true",
+        help="Disable bounded agentic query refinement for substitute mechanisms",
+    )
+    parser.add_argument(
+        "--search-refinement-rounds",
+        type=int,
+        default=DEFAULT_REFINEMENT_MAX_ROUNDS,
+        help="Maximum search refinement rounds per source node (default 2)",
+    )
+    parser.add_argument(
+        "--search-refinement-targets",
+        type=int,
+        default=DEFAULT_REFINEMENT_MAX_TARGETS,
+        help="Maximum claim/detail nodes search refinement may inspect",
+    )
+    parser.add_argument(
+        "--search-refinement-limit",
+        type=int,
+        default=DEFAULT_REFINEMENT_LIMIT,
+        help="Vector hits per refined query",
+    )
+    parser.add_argument(
+        "--search-refinement-queries",
+        type=int,
+        default=DEFAULT_REFINEMENT_QUERIES_PER_TARGET,
+        help="Initial refined queries per source node",
+    )
+    parser.add_argument(
+        "--search-refinement-followups",
+        type=int,
+        default=DEFAULT_REFINEMENT_FOLLOWUPS_PER_TARGET,
+        help="Follow-up queries per failed source node per round",
+    )
+    parser.add_argument(
         "--s2-recommend-limit",
         type=int,
         default=DEFAULT_S2_RECOMMEND_LIMIT,
@@ -94,7 +162,6 @@ def main() -> None:
         type=float,
         default=DEFAULT_REQUEST_DELAY,
     )
-    parser.add_argument("--judge-batch-size", type=int, default=8)
     parser.add_argument(
         "--no-cards",
         action="store_true",
@@ -138,6 +205,7 @@ def main() -> None:
     print(f"Extracted {len(problems)} problem(s).", flush=True)
 
     print("Loading index and searching…", flush=True)
+    search_refinement_trace = []
     with open_index(device=args.device) as index:
         candidates = search_all_candidates(
             problems,
@@ -148,15 +216,55 @@ def main() -> None:
             request_delay=args.request_delay,
         )
         print(f"Search returned {len(candidates)} unique candidate(s).", flush=True)
+        if not args.no_judge and not args.no_search_refinement:
+            seen_ids = (exclude_ids or set()) | {
+                candidate["arxiv_id"] for candidate in candidates
+            }
+            print(
+                "Running agentic search refinement for substitute mechanisms…",
+                flush=True,
+            )
+            try:
+                refined_candidates, search_refinement_trace = (
+                    run_search_refinement(
+                        problems,
+                        index,
+                        limit=args.search_refinement_limit,
+                        max_rounds=args.search_refinement_rounds,
+                        max_targets=args.search_refinement_targets,
+                        queries_per_target=args.search_refinement_queries,
+                        max_followups_per_target=(
+                            args.search_refinement_followups
+                        ),
+                        exclude_ids=seen_ids,
+                    )
+                )
+            except Exception as exc:
+                # Retrieval refinement should improve recall, not block the
+                # baseline search/judge path when the model or API is flaky.
+                print(f"Agentic search refinement skipped: {exc}", flush=True)
+                refined_candidates = []
+                search_refinement_trace = [
+                    {"error": str(exc), "stage": "search_refinement"}
+                ]
+            if refined_candidates:
+                candidates = _merge_candidates(candidates, refined_candidates)
+                print(
+                    "Agentic search refinement added "
+                    f"{len(refined_candidates)} candidate(s); "
+                    f"{len(candidates)} total before judging.",
+                    flush=True,
+                )
+            else:
+                print("Agentic search refinement added no candidates.", flush=True)
 
         if not args.no_judge:
             print("Judging candidates…", flush=True)
             candidates = judge_candidates(
                 problems,
                 candidates,
-                batch_size=args.judge_batch_size,
             )
-            _print_judge_summary("FAISS judge", candidates)
+            _print_judge_summary("Vector judge", candidates)
             if not args.no_s2:
                 seeds = kept_candidates(candidates)
                 print(
@@ -178,7 +286,6 @@ def main() -> None:
                     judged_recs = judge_candidates(
                         problems,
                         recommendations,
-                        batch_size=args.judge_batch_size,
                     )
                     _print_judge_summary("S2 judge", judged_recs)
                     candidates.extend(judged_recs)
@@ -197,6 +304,7 @@ def main() -> None:
         "source_arxiv_ids": sorted(exclude_ids),
         "problems": [problem.model_dump() for problem in problems],
         "candidates": candidates,
+        "search_refinement_trace": search_refinement_trace,
         "kept_count": kept if not args.no_judge else None,
     }
     output_path.write_text(json.dumps(output, indent=2) + "\n")
