@@ -64,17 +64,17 @@ Fill in these three score columns from 1 to 5:
 
 | Column | What to score |
 | --- | --- |
-| `specific_relevance_1_5` | Does this paper directly help with the displayed problem, claim, or implementation detail? |
-| `actionability_1_5` | Does it give the author something concrete to cite, compare against, test, integrate, or revise? |
-| `non_redundancy_1_5` | Does it add something different from other suggestions attached to the same section? |
+| `specific_relevance_1_5` | How contextually related is this paper to the draft node it was attached to? |
+| `actionability_1_5` | Does the paper give an insight the author could realistically integrate into the work? |
+| `non_redundancy_1_5` | Does the paper contribute a distinct integration idea, rather than an analog of an idea already covered by another suggestion? |
 
 Suggested scoring anchors:
 
 | Score | Meaning |
 | ---: | --- |
-| 1 | Broadly related, unclear use, or mostly duplicate. |
-| 3 | Relevant background, but generic or partly overlapping. |
-| 5 | Directly improves that part of the draft and gives a clear next action. |
+| 1 | Weak contextual fit, no usable integration insight, or an idea already covered by another suggestion. |
+| 3 | Contextually related or useful, but generic, indirect, or partly overlapping. |
+| 5 | Strong contextual fit, clear integration insight, or a distinct idea not covered by the other suggestions. |
 
 The blank template is `eval/rubric_template.csv`. The filled CBAM pilot file is
 `eval/runs/cbam_rubric.csv`.

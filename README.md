@@ -2,10 +2,10 @@
 
 ## Purpose
 
-CS/AI moves too quickly for authors to read every relevant new paper before
-submitting their own work. EmbedXiv is a literature-aware paper proofreader: it
-reads a draft, searches a CS arXiv corpus, and surfaces papers that may expose
-gaps in the draft.
+Computer science and AI/ML research move too quickly for authors to keep up with
+every relevant new paper before submitting their own work. EmbedXiv is a
+literature-aware paper proofreader: it reads a draft, searches a CS arXiv
+corpus, and surfaces papers that may expose gaps in the draft.
 
 Those gaps can look like:
 
@@ -544,47 +544,55 @@ python3 eval/summarize_run.py output/full_run_results.json
 
 ### Human scores
 
-Scored on specific relevance, actionability, and non-redundancy. Per-paper
-scores and notes: [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
+Scored on three 1–5 human quality metrics:
+
+- **Relevance**: how contextually related the paper is to the part of the draft
+  it was attached to.
+- **Actionability**: whether the paper gives an insight the author could
+  realistically integrate into the work.
+- **Non-redundancy**: whether the paper contributes a distinct integration idea,
+  rather than an analog of an idea already covered by another suggestion.
+
+Per-paper scores and notes: [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
 
 | Metric | CBAM |
 | --- | ---: |
 | Suggestions rated | 25 |
-| High-quality (relevance ≥ 4 and actionability ≥ 4) | 100% |
-| Mean specific relevance | 4.60 |
-| Mean actionability | 4.68 |
-| Mean non-redundancy | 4.48 |
-| Redundant (non-redundancy ≤ 2) | 0% |
+| High-quality (relevance ≥ 4 and actionability ≥ 4) | 96% |
+| Mean specific relevance | 4.56 |
+| Mean actionability | 4.56 |
+| Mean non-redundancy | 3.88 |
+| Redundant (non-redundancy ≤ 2) | 4% |
 
 Per-paper score table:
 
 | arXiv ID | Paper | Relevance | Actionability | Non-redundancy |
 | --- | --- | ---: | ---: | ---: |
 | `2508.03625` | AttZoom: Attention Zoom for Better Visual Features | 5 | 5 | 5 |
-| `2304.03198` | RFAConv: Receptive-Field Attention Convolution for Improving Convolutional Neural Networks | 5 | 5 | 5 |
-| `2010.05605` | Convolutional Neural Network optimization via Channel Reassessment Attention module | 5 | 4 | 4 |
+| `2304.03198` | RFAConv: Receptive-Field Attention Convolution for Improving Convolutional Neural Networks | 5 | 5 | 4 |
+| `2010.05605` | Convolutional Neural Network optimization via Channel Reassessment Attention module | 5 | 4 | 3 |
 | `2601.07310` | Revisiting the Ordering of Channel and Spatial Attention: A Comprehensive Study on Sequential and Parallel Designs | 5 | 5 | 5 |
-| `2406.00279` | Hybrid attention structure preserving network for reconstruction of under-sampled OCT images | 4 | 4 | 4 |
-| `2012.04578` | Hierarchical Residual Attention Network for Single Image Super-Resolution | 4 | 4 | 5 |
-| `2112.05861` | A Discriminative Channel Diversification Network for Image Classification | 4 | 4 | 4 |
-| `2308.07110` | SCSC: Spatial Cross-scale Convolution Module to Strengthen both CNNs and Transformers | 4 | 4 | 5 |
-| `1709.01507` | Squeeze-and-Excitation Networks | 5 | 5 | 3 |
-| `2107.02145` | Tiled Squeeze-and-Excite: Channel Attention With Local Spatial Context | 4 | 5 | 4 |
-| `2303.11055` | Parameter-Free Channel Attention for Image Classification and Super-Resolution | 5 | 5 | 5 |
+| `2406.00279` | Hybrid attention structure preserving network for reconstruction of under-sampled OCT images | 4 | 4 | 3 |
+| `2012.04578` | Hierarchical Residual Attention Network for Single Image Super-Resolution | 4 | 4 | 4 |
+| `2112.05861` | A Discriminative Channel Diversification Network for Image Classification | 4 | 4 | 3 |
+| `2308.07110` | SCSC: Spatial Cross-scale Convolution Module to Strengthen both CNNs and Transformers | 4 | 4 | 4 |
+| `1709.01507` | Squeeze-and-Excitation Networks | 5 | 5 | 2 |
+| `2107.02145` | Tiled Squeeze-and-Excite: Channel Attention With Local Spatial Context | 4 | 4 | 3 |
+| `2303.11055` | Parameter-Free Channel Attention for Image Classification and Super-Resolution | 5 | 5 | 4 |
 | `2405.05755` | CSA-Net: Channel-wise Spatially Autocorrelated Attention Networks | 4 | 4 | 5 |
 | `2111.13470` | TDAM: Top-Down Attention Module for Contextually Guided Feature Selection in CNNs | 4 | 5 | 5 |
-| `2403.01123` | ELA: Efficient Local Attention for Deep Convolutional Neural Networks | 5 | 5 | 4 |
+| `2403.01123` | ELA: Efficient Local Attention for Deep Convolutional Neural Networks | 5 | 5 | 3 |
 | `2503.10875` | Convolutional Rectangular Attention Module | 5 | 5 | 5 |
-| `1905.04509` | Training CNNs with Selective Allocation of Channels | 4 | 4 | 5 |
-| `2412.09023` | STEAM: Squeeze and Transform Enhanced Attention Module | 4 | 4 | 4 |
+| `1905.04509` | Training CNNs with Selective Allocation of Channels | 3 | 3 | 5 |
+| `2412.09023` | STEAM: Squeeze and Transform Enhanced Attention Module | 4 | 4 | 3 |
 | `2212.06335` | CAT: Learning to Collaborate Channel and Spatial Attention from Multi-Information Fusion | 5 | 5 | 5 |
-| `1910.03151` | ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks | 5 | 5 | 4 |
-| `2601.01002` | Lightweight Channel Attention for Efficient CNNs | 5 | 5 | 4 |
-| `1903.06586` | Selective Kernel Networks | 5 | 5 | 5 |
-| `2112.03740` | Dilated convolution with learnable spacings | 4 | 5 | 4 |
+| `1910.03151` | ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks | 5 | 5 | 3 |
+| `2601.01002` | Lightweight Channel Attention for Efficient CNNs | 5 | 5 | 3 |
+| `1903.06586` | Selective Kernel Networks | 5 | 5 | 4 |
+| `2112.03740` | Dilated convolution with learnable spacings | 4 | 4 | 4 |
 | `2009.06385` | Adaptive Convolution Kernel for Artificial Neural Networks | 5 | 5 | 4 |
 | `1904.05873` | An Empirical Study of Spatial Attention Mechanisms in Deep Networks | 5 | 5 | 5 |
-| `2509.15436` | Region-Aware Deformable Convolutions | 5 | 5 | 4 |
+| `2509.15436` | Region-Aware Deformable Convolutions | 5 | 5 | 3 |
 
 ```bash
 python3 eval/aggregate_scores.py eval/runs/cbam_rubric.csv
