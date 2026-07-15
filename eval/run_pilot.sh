@@ -40,7 +40,7 @@ python3 eval/export_rubric.py "$OUTDIR/no_cap.json" --append -o "$OUTDIR/rubric.
 cat <<EOF
 
 Next steps:
-1. Open $OUTDIR/rubric.csv and score actionability / node_fit / non_redundancy (1–5).
+1. Open $OUTDIR/rubric.csv and score specific_relevance / actionability / non_redundancy (1–5).
 2. python3 eval/aggregate_scores.py $OUTDIR/rubric.csv
 3. Copy funnel + ablation tables into README or your blog post.
 

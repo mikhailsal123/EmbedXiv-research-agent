@@ -505,8 +505,9 @@ Use `--run-label NAME` to tag results JSON for eval comparisons.
 
 ## Pilot evaluation
 
-Ran the full pipeline on CBAM (`1807.06521`) and scored all 25 final
-suggestions by hand (1–5, one rater).
+Ran the full pipeline on CBAM (`1807.06521`), the Convolutional Block Attention
+Module paper for CNN feature refinement, and scored all 25 final suggestions by
+hand (1–5, one rater).
 
 ### Demo output
 
@@ -554,6 +555,36 @@ scores and notes: [`eval/runs/cbam_rubric.csv`](eval/runs/cbam_rubric.csv).
 | Mean actionability | 4.68 |
 | Mean non-redundancy | 4.48 |
 | Redundant (non-redundancy ≤ 2) | 0% |
+
+Per-paper score table:
+
+| arXiv ID | Paper | Relevance | Actionability | Non-redundancy |
+| --- | --- | ---: | ---: | ---: |
+| `2508.03625` | AttZoom: Attention Zoom for Better Visual Features | 5 | 5 | 5 |
+| `2304.03198` | RFAConv: Receptive-Field Attention Convolution for Improving Convolutional Neural Networks | 5 | 5 | 5 |
+| `2010.05605` | Convolutional Neural Network optimization via Channel Reassessment Attention module | 5 | 4 | 4 |
+| `2601.07310` | Revisiting the Ordering of Channel and Spatial Attention: A Comprehensive Study on Sequential and Parallel Designs | 5 | 5 | 5 |
+| `2406.00279` | Hybrid attention structure preserving network for reconstruction of under-sampled OCT images | 4 | 4 | 4 |
+| `2012.04578` | Hierarchical Residual Attention Network for Single Image Super-Resolution | 4 | 4 | 5 |
+| `2112.05861` | A Discriminative Channel Diversification Network for Image Classification | 4 | 4 | 4 |
+| `2308.07110` | SCSC: Spatial Cross-scale Convolution Module to Strengthen both CNNs and Transformers | 4 | 4 | 5 |
+| `1709.01507` | Squeeze-and-Excitation Networks | 5 | 5 | 3 |
+| `2107.02145` | Tiled Squeeze-and-Excite: Channel Attention With Local Spatial Context | 4 | 5 | 4 |
+| `2303.11055` | Parameter-Free Channel Attention for Image Classification and Super-Resolution | 5 | 5 | 5 |
+| `2405.05755` | CSA-Net: Channel-wise Spatially Autocorrelated Attention Networks | 4 | 4 | 5 |
+| `2111.13470` | TDAM: Top-Down Attention Module for Contextually Guided Feature Selection in CNNs | 4 | 5 | 5 |
+| `2403.01123` | ELA: Efficient Local Attention for Deep Convolutional Neural Networks | 5 | 5 | 4 |
+| `2503.10875` | Convolutional Rectangular Attention Module | 5 | 5 | 5 |
+| `1905.04509` | Training CNNs with Selective Allocation of Channels | 4 | 4 | 5 |
+| `2412.09023` | STEAM: Squeeze and Transform Enhanced Attention Module | 4 | 4 | 4 |
+| `2212.06335` | CAT: Learning to Collaborate Channel and Spatial Attention from Multi-Information Fusion | 5 | 5 | 5 |
+| `1910.03151` | ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks | 5 | 5 | 4 |
+| `2601.01002` | Lightweight Channel Attention for Efficient CNNs | 5 | 5 | 4 |
+| `1903.06586` | Selective Kernel Networks | 5 | 5 | 5 |
+| `2112.03740` | Dilated convolution with learnable spacings | 4 | 5 | 4 |
+| `2009.06385` | Adaptive Convolution Kernel for Artificial Neural Networks | 5 | 5 | 4 |
+| `1904.05873` | An Empirical Study of Spatial Attention Mechanisms in Deep Networks | 5 | 5 | 5 |
+| `2509.15436` | Region-Aware Deformable Convolutions | 5 | 5 | 4 |
 
 ```bash
 python3 eval/aggregate_scores.py eval/runs/cbam_rubric.csv
